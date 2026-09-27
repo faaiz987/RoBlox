@@ -59,6 +59,7 @@ src/
   client/                        -> StarterPlayer.StarterPlayerScripts.Client
     CombatController.client.luau input, camera shake/FOV, sword posing, telegraph UI
     PerkUI.client.luau           perk cards, wave banner, HUD, health bar
+    CombatHUD.client.luau        control hints + live parry/dodge cooldown badges
 ```
 
 > **Rojo file naming:** a plain `*.luau` file syncs as a *ModuleScript*, so files that must run carry the `*.server.luau` (Script) or `*.client.luau` (LocalScript) suffix. Modules such as `CombatConfig.luau` and `KatanaFactory.luau` intentionally stay plain.

@@ -84,6 +84,16 @@ gui.IgnoreGuiInset = true
 gui.DisplayOrder = 20
 gui.Parent = playerGui
 
+-- The card overlay lives on its own ScreenGui so a picked perk can hide the
+-- whole choice UI with a single `Enabled = false` (the HUD above stays put).
+local choiceGui = Instance.new("ScreenGui")
+choiceGui.Name = "PerkChoiceGui"
+choiceGui.ResetOnSpawn = false
+choiceGui.IgnoreGuiInset = true
+choiceGui.DisplayOrder = 30
+choiceGui.Enabled = false
+choiceGui.Parent = playerGui
+
 local function corner(parent: Instance, radius: number): UICorner
 	local cornerInstance = Instance.new("UICorner")
 	cornerInstance.CornerRadius = UDim.new(0, radius)
@@ -225,7 +235,7 @@ overlay.BackgroundColor3 = PALETTE.Backdrop
 overlay.BackgroundTransparency = 1
 overlay.BorderSizePixel = 0
 overlay.Visible = false
-overlay.Parent = gui
+overlay.Parent = choiceGui
 
 local overlayGradient = Instance.new("UIGradient")
 overlayGradient.Rotation = 90
@@ -333,6 +343,11 @@ local cards: { CardUi } = {}
 local choiceOpen = false
 local picking = false
 local currentCards: { Card } = {}
+
+-- Forward declaration: buildCard's Activated handler closes over this, so it
+-- must exist as a local *before* the cards are built (a later `local function`
+-- would be read as a nil global at click time and the overlay would never hide).
+local closeChoice: (Card?) -> ()
 
 local function buildCard(index: number): CardUi
 	local root = Instance.new("TextButton")
@@ -444,6 +459,7 @@ local function buildCard(index: number): CardUi
 		cardStroke.Transparency = 0.35
 	end)
 
+	-- Activated fires for both mouse and touch, unlike MouseButton1Click.
 	root.Activated:Connect(function()
 		if picking or not choiceOpen then
 			return
@@ -453,9 +469,19 @@ local function buildCard(index: number): CardUi
 			return
 		end
 		picking = true
-		selectPerkRemote:FireServer(card.id)
-		TweenService:Create(scale, TweenInfo.new(0.22, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1.12 }):Play()
+
+		-- Kill duplicate triggers immediately: a double-tap must not send two picks.
+		for _, other in cards do
+			other.root.Active = false
+			other.root.Selectable = false
+		end
+
+		-- Instant feedback before the overlay drops away.
 		playLocalSound(CombatConfig.Fx.PerkSelect, 0.6, 1.2)
+		TweenService:Create(scale, TweenInfo.new(0.18, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1.12 }):Play()
+		TweenService:Create(root, TweenInfo.new(0.18), { BackgroundColor3 = card.color:Lerp(PALETTE.Ink, 0.2) }):Play()
+
+		selectPerkRemote:FireServer(card.id)
 		closeChoice(card)
 	end)
 
@@ -470,11 +496,13 @@ end
 -- Choice lifecycle
 -- ---------------------------------------------------------------------------
 
-local function closeChoice(chosen: Card?)
+closeChoice = function(chosen: Card?)
 	choiceOpen = false
 	player:SetAttribute(ATTR.ChoiceOpen, false)
 
 	for _, ui in cards do
+		ui.root.Active = false
+		ui.root.Selectable = false
 		TweenService:Create(ui.scale, TweenInfo.new(0.2), { Scale = if chosen and ui.selectedId == chosen.id then 1.2 else 0.9 }):Play()
 		TweenService:Create(ui.root, TweenInfo.new(0.25), { BackgroundTransparency = 0.4 }):Play()
 	end
@@ -482,8 +510,11 @@ local function closeChoice(chosen: Card?)
 	TweenService:Create(overlay, TweenInfo.new(0.3), { BackgroundTransparency = 1 }):Play()
 	task.delay(0.3, function()
 		overlay.Visible = false
+		-- ScreenGui-level hide: one switch drops every card and the backdrop.
+		choiceGui.Enabled = false
 		for _, ui in cards do
 			ui.root.BackgroundTransparency = 0
+			ui.root.BackgroundColor3 = PALETTE.Panel
 			ui.scale.Scale = 1
 		end
 	end)
@@ -501,6 +532,7 @@ local function openChoice(payload: ChoicePayload)
 	player:SetAttribute(ATTR.ChoiceOpen, true)
 
 	overlaySubtitle.Text = `Wave {payload.wave} cleared. Claim one boon before the next assault.`
+	choiceGui.Enabled = true
 	overlay.Visible = true
 	overlay.BackgroundTransparency = 0.08
 
@@ -509,6 +541,9 @@ local function openChoice(payload: ChoicePayload)
 		if card then
 			ui.selectedId = card.id
 			ui.root.Visible = true
+			ui.root.Active = true
+			ui.root.Selectable = true
+			ui.root.BackgroundColor3 = PALETTE.Panel
 			ui.title.Text = card.title
 			ui.rarity.Text = string.upper(card.rarity)
 			ui.rarity.TextColor3 = RARITY_COLORS[card.rarity] or PALETTE.Muted

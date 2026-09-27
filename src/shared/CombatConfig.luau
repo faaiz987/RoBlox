@@ -305,8 +305,11 @@ CombatConfig.Attributes = {
 	-- Written by WaveManager (players) and EnemyAI (enemies)
 	Wave = "CB_Wave",
 
-	-- Written by the client for its own input gating (never replicated).
+	-- Written by the client for its own input gating and HUD (never replicated).
 	ChoiceOpen = "CB_ChoiceOpen",
+	-- Absolute os.clock() timestamps when dodge / parry are ready again.
+	DodgeReadyAt = "CB_DodgeReadyAt",
+	ParryReadyAt = "CB_ParryReadyAt",
 
 	-- Written by EnemyAI (enemies)
 	Archetype = "CB_Archetype",

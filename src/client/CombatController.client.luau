@@ -292,7 +292,11 @@ type SwordRig = {
 	trail: Trail?,
 }
 
+-- Mirrors KatanaFactory's grip frame so a client-side repair weld lines up.
+local GRIP_OFFSET = CFrame.new(0, 0.3, -0.1) * CFrame.Angles(math.rad(180), 0, 0)
+
 local swords: { [Model]: SwordRig } = {}
+local armTweens: { [Model]: Tween } = {}
 
 local function findShoulder(character: Model): Motor6D?
 	for _, name in RIG.ShoulderJointNames do
@@ -305,9 +309,58 @@ local function findShoulder(character: Model): Motor6D?
 	return nil
 end
 
+local function findHand(character: Model): BasePart?
+	for _, name in RIG.HandNames do
+		local found = character:FindFirstChild(name)
+		if found and found:IsA("BasePart") then
+			return found
+		end
+	end
+	return nil
+end
+
+--[[
+	Ensures the katana is welded to the right hand. The server normally builds
+	this Motor6D; this local repair only fires if the weld is genuinely missing
+	(partial replication), so the blade is never left floating.
+]]
+local function ensureKatanaWeld(character: Model)
+	local model = character:FindFirstChild(RIG.KatanaName)
+	if not model or not model:IsA("Model") then
+		return
+	end
+	local handle = model:FindFirstChild("Handle")
+	local hand = findHand(character)
+	if not handle or not handle:IsA("BasePart") or not hand then
+		return
+	end
+
+	local existing = hand:FindFirstChild(RIG.KatanaGripName)
+	if existing and existing:IsA("Motor6D") and existing.Part0 == hand and existing.Part1 == handle then
+		return
+	end
+	if existing then
+		existing:Destroy()
+	end
+
+	local weld = Instance.new("Motor6D")
+	weld.Name = RIG.KatanaGripName
+	weld.Part0 = hand
+	weld.Part1 = handle
+	weld.C0 = GRIP_OFFSET
+	weld.C1 = CFrame.new()
+	weld.Parent = hand
+end
+
+--[[
+	Resolves the sword rig for a character.
+	A rig is only memoized once its shoulder joint is known, so a character whose
+	arms replicate a frame late is re-resolved on the next swing instead of being
+	frozen in a permanently un-posable state.
+]]
 local function getSword(character: Model): SwordRig?
 	local cached = swords[character]
-	if cached and cached.model.Parent == character then
+	if cached and cached.model.Parent == character and cached.shoulder and cached.baseC0 then
 		return cached
 	end
 
@@ -325,7 +378,9 @@ local function getSword(character: Model): SwordRig?
 		baseC0 = if shoulder then shoulder.C0 else nil,
 		trail = if trail and trail:IsA("Trail") then trail else nil,
 	}
-	swords[character] = rig
+	if shoulder and rig.baseC0 then
+		swords[character] = rig
+	end
 	return rig
 end
 
@@ -347,10 +402,73 @@ local function setTrailEnabled(rig: SwordRig, enabled: boolean, duration: number
 	end
 end
 
--- Windup -> impact -> recovery, timed off the shared combo data.
+-- Cancels whatever arm tween is mid-flight for a character.
+local function cancelArmTween(character: Model)
+	local tween = armTweens[character]
+	if tween then
+		tween:Cancel()
+		armTweens[character] = nil
+	end
+end
+
+local function ensureBladeAttachment(blade: BasePart, name: string, y: number): Attachment
+	local found = blade:FindFirstChild(name)
+	if found and found:IsA("Attachment") then
+		return found
+	end
+	local created = Instance.new("Attachment")
+	created.Name = name
+	created.Position = Vector3.new(0, y, 0)
+	created.Parent = blade
+	return created
+end
+
+--[[
+	Paints a temporary slash ribbon across the blade for this swing.
+	Falls back to a Beam between the hilt and tip so the cut is obvious even if
+	the katana's built-in Trail is missing.
+]]
+local function spawnSlashArc(character: Model, color: Color3?)
+	local model = character:FindFirstChild(RIG.KatanaName)
+	if not model or not model:IsA("Model") then
+		return
+	end
+	local bladeInstance = model:FindFirstChild("Blade")
+	if not bladeInstance or not bladeInstance:IsA("BasePart") then
+		return
+	end
+	local blade = bladeInstance :: BasePart
+
+	local hilt = ensureBladeAttachment(blade, "Hilt", -1.65)
+	local tip = ensureBladeAttachment(blade, "Tip", 1.65)
+
+	local beam = Instance.new("Beam")
+	beam.Name = "CB_SlashArc"
+	beam.Attachment0 = hilt
+	beam.Attachment1 = tip
+	beam.FaceCamera = true
+	beam.LightEmission = 0.65
+	beam.Width0 = 0.5
+	beam.Width1 = 1.1
+	beam.Color = ColorSequence.new(color or FXCFG.SlashColor)
+	beam.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.05),
+		NumberSequenceKeypoint.new(1, 0.6),
+	})
+	beam.Parent = blade
+	Debris:AddItem(beam, 0.22)
+end
+
+--[[
+	Windup -> impact -> recovery, posed with TweenService on the shoulder Motor6D
+	so it works on both R6 ("Right Shoulder") and R15 ("RightShoulder"). This is
+	the procedural fallback when no arm animation asset is authored.
+]]
 local function playSwing(character: Model, stepIndex: number, attackSpeed: number, color: Color3?)
 	local rig = getSword(character)
 	if not rig or not rig.shoulder or not rig.baseC0 then
+		-- No posable joints yet: still flash a blade arc so the cut reads.
+		spawnSlashArc(character, color)
 		return
 	end
 
@@ -361,8 +479,8 @@ local function playSwing(character: Model, stepIndex: number, attackSpeed: numbe
 
 	local step = CombatConfig.getComboStep(stepIndex)
 	local speed = math.max(attackSpeed, 0.2)
-	local windup = step.windup / speed
-	local recovery = step.recovery / speed
+	local windup = math.max(step.windup / speed, 0.02)
+	local recovery = math.max(step.recovery / speed, 0.02)
 
 	local windupPose: Pose = if step.kind == "Heavy"
 		then POSES.HeavyWindup
@@ -374,39 +492,41 @@ local function playSwing(character: Model, stepIndex: number, attackSpeed: numbe
 		rig.trail.Color = ColorSequence.new(color)
 	end
 
-	task.spawn(function()
-		local startedAt = now()
-		while true do
-			if trailSerial[character] ~= serial then
-				return
-			end
-			local alpha = math.clamp((now() - startedAt) / windup, 0, 1)
-			shoulder.C0 = baseC0 * poseCFrame(windupPose, alpha)
-			if alpha >= 1 then
-				break
-			end
-			RunService.RenderStepped:Wait()
+	cancelArmTween(character)
+
+	local windupTween = TweenService:Create(
+		shoulder,
+		TweenInfo.new(windup, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ C0 = baseC0 * poseCFrame(windupPose, 1) }
+	)
+	armTweens[character] = windupTween
+	windupTween:Play()
+
+	task.delay(windup, function()
+		if trailSerial[character] ~= serial then
+			return
 		end
 
+		-- Snap through the cut and fire trail + arc on the same beat.
 		shoulder.C0 = baseC0 * poseCFrame(impactPose, 1)
-		setTrailEnabled(rig, true, math.min(0.14, recovery))
+		setTrailEnabled(rig, true, math.min(0.16, recovery))
+		spawnSlashArc(character, color)
 
-		local impactAt = now()
-		while true do
-			if trailSerial[character] ~= serial then
-				return
+		local recoveryTween = TweenService:Create(
+			shoulder,
+			TweenInfo.new(recovery, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+			{ C0 = baseC0 }
+		)
+		armTweens[character] = recoveryTween
+		recoveryTween:Play()
+		recoveryTween.Completed:Connect(function()
+			if trailSerial[character] == serial then
+				shoulder.C0 = baseC0
 			end
-			local alpha = math.clamp((now() - impactAt) / recovery, 0, 1)
-			shoulder.C0 = baseC0 * poseCFrame(impactPose, 1 - alpha)
-			if alpha >= 1 then
-				break
+			if armTweens[character] == recoveryTween then
+				armTweens[character] = nil
 			end
-			RunService.RenderStepped:Wait()
-		end
-
-		if trailSerial[character] == serial then
-			shoulder.C0 = baseC0
-		end
+		end)
 	end)
 end
 
@@ -418,6 +538,8 @@ local function holdGuardPose(pose: Pose)
 	end
 	local rig = getSword(character)
 	if rig and rig.shoulder and rig.baseC0 then
+		-- Guarding always wins over an in-flight swing tween.
+		cancelArmTween(character)
 		rig.shoulder.C0 = rig.baseC0 * poseCFrame(pose, 1)
 	end
 end
@@ -749,6 +871,7 @@ local function submitParry()
 	local window = attrNumber(ATTR.ParryWindow, CombatConfig.Timings.ParryWindow)
 	-- Mirror the server's post-perk cooldown so local feedback never lies.
 	state.parryCooldownUntil = timestamp + attrNumber(ATTR.ParryCooldown, CombatConfig.Timings.ParryCooldown)
+	player:SetAttribute(ATTR.ParryReadyAt, state.parryCooldownUntil)
 	state.guarding = false
 
 	holdGuardPose(POSES.ParryGuard)
@@ -799,6 +922,7 @@ local function submitDodge()
 	end
 	local cooldown = attrNumber(ATTR.DodgeCooldown, CombatConfig.Timings.DodgeCooldown)
 	state.dodgeCooldownUntil = timestamp + cooldown
+	player:SetAttribute(ATTR.DodgeReadyAt, state.dodgeCooldownUntil)
 
 	local direction = if humanoid.MoveDirection.Magnitude > 0.1 then flat(humanoid.MoveDirection) else flat(root.CFrame.LookVector) * -1
 	dodgeDash(direction)
@@ -879,8 +1003,13 @@ local function bindCharacter(character: Model)
 	if humanoid and humanoid:IsA("Humanoid") then
 		bindDoubleJump(humanoid)
 	end
-	-- Warm the sword cache so the first swing never hitches.
+	-- Warm the sword cache and repair the grip weld if replication was partial.
 	task.delay(0.5, function()
+		ensureKatanaWeld(character)
+		getSword(character)
+	end)
+	task.delay(2, function()
+		ensureKatanaWeld(character)
 		getSword(character)
 	end)
 end
@@ -944,6 +1073,10 @@ fxRemote.OnClientEvent:Connect(function(payload: unknown)
 		flash(parryFlash, 0.6, 0.35)
 		playOneShot(FXCFG.ParryClash, 0.7, 1, nil)
 		if isMine then
+			-- A perfect read shortens the cooldown server-side; mirror it locally
+			-- so the HUD's parry badge flips back to ready on time.
+			state.parryCooldownUntil = math.min(state.parryCooldownUntil, now() + 0.12)
+			player:SetAttribute(ATTR.ParryReadyAt, state.parryCooldownUntil)
 			addTrauma(0.85)
 			addFov(-5)
 			addRoll(6)
