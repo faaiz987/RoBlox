@@ -22,6 +22,14 @@
 	The rig is an anchored-root R6 body: the HumanoidRootPart is driven directly and
 	the limbs follow through Motor6D joints, so movement is frame-perfect and free
 	of network-ownership jitter.
+
+	Presentation, in one place:
+	  * a shadow-warrior silhouette -- near-black cloth, a glowing sash and crimson
+	    emissive eyes -- with a katana in the right hand
+	  * chase locomotion from `CombatConfig.Animations.Enemy` when a clip is
+	    authored, otherwise a procedural stride, so nobody glides
+	  * a windup tell you cannot miss: the pose, a hot orb over the head and a
+	    particle plume, all firing for the whole telegraph window
 ]]
 
 local Players = game:GetService("Players")
@@ -33,6 +41,7 @@ local TweenService = game:GetService("TweenService")
 
 local CombatConfig = require(ReplicatedStorage.Shared.CombatConfig)
 local Remotes = require(ReplicatedStorage.Shared.Remotes)
+local Animations = require(ReplicatedStorage.Shared.Animations)
 local KatanaFactory = require(script.Parent.KatanaFactory)
 
 local ATTR = CombatConfig.Attributes
@@ -58,10 +67,23 @@ type EnemyHitReport = {
 
 type EnemyPhase = "Spawn" | "Chase" | "Windup" | "Recover" | "Stagger" | "Stun" | "Dead"
 
+-- Everything the rig needs to be *animated*: the joints it may move, their rest
+-- C0 (captured before any posing, so nothing ever drifts), and the glow parts.
+type Presentation = {
+	joints: { [string]: Motor6D },
+	rest: { [string]: CFrame },
+	eyes: { BasePart },
+	orb: BasePart,
+	emitter: ParticleEmitter,
+	-- Repeating pulse tween, cancelled the moment the windup ends.
+	orbTween: Tween?,
+}
+
 type Enemy = {
 	model: Model,
 	humanoid: Humanoid,
 	root: BasePart,
+	presentation: Presentation,
 	katana: Katana?,
 	archetype: Archetype,
 	phase: EnemyPhase,
@@ -79,6 +101,11 @@ type Enemy = {
 	speedMultiplier: number,
 	wave: number,
 	telegraphActive: boolean,
+	-- Locomotion: the clip currently driving the legs (nil = procedural stride).
+	locomotion: string?,
+	-- Procedural stride phase, in radians.
+	stridePhase: number,
+	strideActive: boolean,
 }
 
 -- ---------------------------------------------------------------------------
@@ -102,6 +129,8 @@ local order: { Model } = {}
 local STAGGER_TIME = 0.85
 local SPAWN_GRACE = 0.5
 local KNOCKBACK_DECAY = 9
+-- Ground speed treated as a brisk walk; above it the stride/clip runs faster.
+local RUN_SPEED_REFERENCE = 12
 
 local function broadcastFx(payload: Remotes.FxPayload)
 	fxRemote:FireAllClients(payload)
@@ -138,12 +167,36 @@ local JOINT_PIVOTS = {
 	{ name = "Left Hip", part = "Left Leg", pivot = Vector3.new(-0.5, -1, 0) },
 }
 
-local function newBodyPart(name: string, size: Vector3, color: Color3, transparency: number): Part
+-- Emissive eyes, sunk a hair into the mask's front face (head front = z -0.75).
+local EYE_LAYOUT = {
+	{ name = "EyeLeft", offset = Vector3.new(-0.32, 1.84, -0.7) },
+	{ name = "EyeRight", offset = Vector3.new(0.32, 1.84, -0.7) },
+}
+
+local EYE_SIZE = Vector3.new(0.36, 0.15, 0.2)
+
+--[[
+	Procedural stride. The right arm is deliberately excluded: it carries the blade
+	and is owned by KatanaFactory, so only the off arm counters the hips.
+]]
+local STRIDE_LAYOUT = {
+	{ joint = "Right Hip", offset = 0, amplitude = 36 },
+	{ joint = "Left Hip", offset = math.pi, amplitude = 36 },
+	{ joint = "Left Shoulder", offset = 0, amplitude = 18 },
+}
+
+local function newBodyPart(
+	name: string,
+	size: Vector3,
+	color: Color3,
+	material: Enum.Material,
+	transparency: number
+): Part
 	local part = Instance.new("Part")
 	part.Name = name
 	part.Size = size
 	part.Color = color
-	part.Material = Enum.Material.SmoothPlastic
+	part.Material = material
 	part.Transparency = transparency
 	part.Anchored = name == "HumanoidRootPart"
 	part.CanCollide = false
@@ -152,7 +205,28 @@ local function newBodyPart(name: string, size: Vector3, color: Color3, transpare
 	part.Massless = true
 	part.TopSurface = Enum.SurfaceType.Smooth
 	part.BottomSurface = Enum.SurfaceType.Smooth
+	-- The root is an invisible driver; it must not paint a blob shadow.
+	part.CastShadow = name ~= "HumanoidRootPart"
 	return part
+end
+
+-- Emissive trim/eye slab: Neon so it feeds the Bloom in Lighting.
+local function newGlowPart(name: string, size: Vector3, color: Color3, transparency: number): Part
+	local part = newBodyPart(name, size, color, Enum.Material.Neon, transparency)
+	part.CanQuery = false
+	part.CastShadow = false
+	return part
+end
+
+-- Welds a decorative slab to the limb that carries it (eyes to the head, sash to
+-- the torso) without giving it simulated mass of its own.
+local function weldDeco(part: BasePart, host: BasePart, offset: Vector3)
+	part.CFrame = host.CFrame * CFrame.new(offset)
+	local weld = Instance.new("WeldConstraint")
+	weld.Name = "Deco"
+	weld.Part0 = host
+	weld.Part1 = part
+	weld.Parent = part
 end
 
 local function newMotor(name: string, part0: BasePart, part1: BasePart, c0: CFrame, c1: CFrame): Motor6D
@@ -177,40 +251,107 @@ local function newSound(name: string, soundId: string, parent: Instance, volume:
 	return sound
 end
 
--- Builds one enemy rig, facing `lookAt`, with its feet planted at origin.Y.
-local function createRig(archetype: Archetype, origin: Vector3, lookAt: Vector3): (Model, Humanoid, BasePart)
+--[[
+	Builds one enemy rig, facing `lookAt`, with its feet planted at origin.Y.
+	Returns the presentation record too, so the AI can animate the same rig it built.
+]]
+local function createRig(
+	archetype: Archetype,
+	origin: Vector3,
+	lookAt: Vector3
+): (Model, Humanoid, BasePart, Presentation)
 	local model = Instance.new("Model")
 	model.Name = `{archetype.label}`
 	model:SetAttribute(ATTR.Archetype, archetype.id)
 
-	local root = newBodyPart("HumanoidRootPart", Vector3.new(2, 2, 1), archetype.bodyColor, 1)
+	local root = newBodyPart(
+		"HumanoidRootPart",
+		Vector3.new(2, 2, 1),
+		archetype.bodyColor,
+		Enum.Material.SmoothPlastic,
+		1
+	)
 	root.Parent = model
 
 	local parts: { [string]: Part } = { HumanoidRootPart = root }
 
+	-- Shadow-warrior palette: near-black cloth on the torso and head, one step
+	-- darker on the limbs, wearing the archetype's material grain.
 	for _, entry in PART_LAYOUT do
-		local offset = entry.offset
-		local color = if entry.name == "Head" then archetype.accentColor else archetype.bodyColor
-		local part = newBodyPart(entry.name, entry.size, color, 0)
-		part.CFrame = CFrame.new(offset)
+		local isLimb = entry.name ~= "Torso" and entry.name ~= "Head"
+		local color = if isLimb then archetype.limbColor else archetype.bodyColor
+		local part = newBodyPart(entry.name, entry.size, color, archetype.bodyMaterial, 0)
+		part.CFrame = CFrame.new(entry.offset)
 		part.Parent = model
 		parts[entry.name] = part
 	end
 
-	newMotor("RootJoint", root, parts.Torso, CFrame.new(), CFrame.new())
+	-- Joints are collected so the locomotion stride can drive them here; each rest
+	-- C0 is captured *before* anything poses, so the stride can never drift.
+	local joints: { [string]: Motor6D } = {}
+	local rest: { [string]: CFrame } = {}
+
+	local rootJoint = newMotor("RootJoint", root, parts.Torso, CFrame.new(), CFrame.new())
+	joints.RootJoint = rootJoint
+	rest.RootJoint = rootJoint.C0
+
 	for _, joint in JOINT_PIVOTS do
 		local limb = parts[joint.part]
 		local pivot = joint.pivot
 		local limbCenter = limb.CFrame.Position
 		-- C1 is the joint position expressed in the limb's own space.
-		newMotor(
+		local motor = newMotor(
 			joint.name,
 			parts.Torso :: BasePart,
 			limb,
 			CFrame.new(pivot),
 			CFrame.new(pivot - limbCenter)
 		)
+		joints[joint.name] = motor
+		rest[joint.name] = motor.C0
 	end
+
+	-- Glowing highlights: crimson eyes, an emissive sash in the archetype's colour
+	-- and the telegraph orb that hangs over the head during a windup.
+	local head = parts.Head :: BasePart
+	local torso = parts.Torso :: BasePart
+
+	local eyes: { BasePart } = {}
+	for _, eye in EYE_LAYOUT do
+		local part = newGlowPart(eye.name, EYE_SIZE, archetype.eyeColor, 0)
+		part.Parent = model
+		weldDeco(part, head, eye.offset - head.CFrame.Position)
+		table.insert(eyes, part)
+	end
+
+	local sash = newGlowPart("Sash", Vector3.new(2.04, 0.34, 1.04), archetype.glowColor, 0.25)
+	sash.Parent = model
+	weldDeco(sash, torso, Vector3.new(0, -0.25, 0))
+
+	local orb = newGlowPart("TelegraphOrb", Vector3.new(0.95, 0.95, 0.95), archetype.glowColor, 1)
+	orb.Shape = Enum.PartType.Ball
+	orb.Parent = model
+	weldDeco(orb, head, Vector3.new(0, 1.85, 0))
+
+	local emitter = Instance.new("ParticleEmitter")
+	emitter.Name = "TelegraphSparks"
+	emitter.LightEmission = 1
+	emitter.LightInfluence = 0
+	emitter.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1.15),
+		NumberSequenceKeypoint.new(1, 0),
+	})
+	emitter.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.15),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	emitter.Color = ColorSequence.new(archetype.glowColor)
+	emitter.Lifetime = NumberRange.new(0.35, 0.7)
+	emitter.Speed = NumberRange.new(2, 5)
+	emitter.SpreadAngle = Vector2.new(24, 24)
+	emitter.Acceleration = Vector3.new(0, 7, 0)
+	emitter.Rate = 0
+	emitter.Parent = orb
 
 	local humanoid = Instance.new("Humanoid")
 	humanoid.RigType = Enum.HumanoidRigType.R6
@@ -227,9 +368,9 @@ local function createRig(archetype: Archetype, origin: Vector3, lookAt: Vector3)
 	humanoid.Parent = model
 
 	-- Presentation sounds travel with the rig.
-	newSound("Telegraph", TELEGRAPH.ParryableSound, parts.Head, 0.55)
-	newSound("Clash", CombatConfig.Fx.ParryClash, parts.Head, 0.7)
-	newSound("Death", CombatConfig.Fx.EnemyDeath, parts.Head, 0.6)
+	newSound("Telegraph", TELEGRAPH.ParryableSound, head, 0.55)
+	newSound("Clash", CombatConfig.Fx.ParryClash, head, 0.7)
+	newSound("Death", CombatConfig.Fx.EnemyDeath, head, 0.6)
 
 	model.PrimaryPart = root
 	model.Parent = enemyFolder
@@ -237,7 +378,15 @@ local function createRig(archetype: Archetype, origin: Vector3, lookAt: Vector3)
 	local facing = flat(lookAt - origin)
 	root.CFrame = CFrame.lookAt(Vector3.new(origin.X, origin.Y, origin.Z), Vector3.new(origin.X, origin.Y, origin.Z) + facing)
 
-	return model, humanoid, root
+	local presentation: Presentation = {
+		joints = joints,
+		rest = rest,
+		eyes = eyes,
+		orb = orb,
+		emitter = emitter,
+		orbTween = nil,
+	}
+	return model, humanoid, root, presentation
 end
 
 local function playSound(model: Model, soundName: string, pitch: number?)
@@ -249,14 +398,155 @@ local function playSound(model: Model, soundName: string, pitch: number?)
 end
 
 -- ---------------------------------------------------------------------------
+-- Locomotion
+--   Chase movement is built from the rig's own joints. An authored clip
+--   (CombatConfig.Animations.Enemy) takes over when one is configured; otherwise
+--   the stride below runs, so an enemy is never seen gliding across the arena.
+-- ---------------------------------------------------------------------------
+
+-- Snaps the stride joints back to their rest C0 (called whenever a chase ends).
+local function stopStride(enemy: Enemy)
+	if not enemy.strideActive then
+		return
+	end
+	enemy.strideActive = false
+
+	local presentation = enemy.presentation
+	for _, entry in STRIDE_LAYOUT do
+		local motor = presentation.joints[entry.joint]
+		local base = presentation.rest[entry.joint]
+		if motor and base then
+			motor.C0 = base
+		end
+	end
+
+	local rootJoint = presentation.joints.RootJoint
+	local rootBase = presentation.rest.RootJoint
+	if rootJoint and rootBase then
+		rootJoint.C0 = rootBase
+	end
+end
+
+-- Advances the procedural stride: hips swing in opposition, the off arm counters.
+local function stepStride(enemy: Enemy, deltaTime: number, rate: number)
+	local presentation = enemy.presentation
+	local phase = enemy.stridePhase + deltaTime * rate
+	enemy.stridePhase = phase
+	enemy.strideActive = true
+
+	for _, entry in STRIDE_LAYOUT do
+		local motor = presentation.joints[entry.joint]
+		local base = presentation.rest[entry.joint]
+		if motor and base then
+			local swing = math.sin(phase + entry.offset) * entry.amplitude
+			motor.C0 = base * CFrame.Angles(math.rad(swing), 0, 0)
+		end
+	end
+
+	-- Shallow body bob pushing off with each step.
+	local rootJoint = presentation.joints.RootJoint
+	local rootBase = presentation.rest.RootJoint
+	if rootJoint and rootBase then
+		rootJoint.C0 = rootBase * CFrame.new(0, math.abs(math.sin(phase)) * 0.14 - 0.07, 0)
+	end
+end
+
+-- Picks the locomotion source for this frame's ground speed.
+local function driveLocomotion(enemy: Enemy, deltaTime: number, speedRatio: number)
+	local key = if speedRatio >= 1.08 then "Run" else "Walk"
+	if enemy.locomotion ~= key then
+		local track = Animations.play(enemy.model, key, "Enemy", 0.2, math.clamp(speedRatio, 0.5, 2), 1)
+		if track then
+			local previous = enemy.locomotion
+			if previous then
+				Animations.stop(enemy.model, previous, 0.2)
+			end
+			enemy.locomotion = key
+		elseif enemy.locomotion then
+			-- The clip vanished mid-chase: hand the legs back to the stride.
+			Animations.stop(enemy.model, enemy.locomotion, 0.2)
+			enemy.locomotion = nil
+		end
+	end
+
+	if enemy.locomotion then
+		stopStride(enemy)
+		return
+	end
+	stepStride(enemy, deltaTime, 2.2 + speedRatio * 1.8)
+end
+
+-- Stops whatever is driving the legs; used on every transition out of a chase.
+local function haltLocomotion(enemy: Enemy)
+	if enemy.locomotion then
+		Animations.stop(enemy.model, enemy.locomotion, 0.18)
+		enemy.locomotion = nil
+	end
+	stopStride(enemy)
+end
+
+-- ---------------------------------------------------------------------------
 -- Telegraphs
 -- ---------------------------------------------------------------------------
+
+--[[
+	Arms the windup tell: the orb over the head fades in and pulses, the particle
+	plume switches on and the eyes flare. Amber for a parryable cut, crimson for the
+	unparryable flash cut -- the same language the client's billboard speaks.
+]]
+local function armTelegraphGlow(enemy: Enemy)
+	local presentation = enemy.presentation
+	local color = if enemy.unparryable then TELEGRAPH.UnparryableColor else TELEGRAPH.ParryableColor
+
+	local orb = presentation.orb
+	orb.Color = color
+	orb.Transparency = 0.12
+	orb.Size = Vector3.new(0.8, 0.8, 0.8)
+
+	local pulse = TweenService:Create(
+		orb,
+		TweenInfo.new(0.28, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+		{ Size = Vector3.new(1.7, 1.7, 1.7) }
+	)
+	presentation.orbTween = pulse
+	pulse:Play()
+
+	local emitter = presentation.emitter
+	emitter.Color = ColorSequence.new(color)
+	emitter.Rate = if enemy.unparryable then 34 else 22
+	emitter:Emit(if enemy.unparryable then 18 else 12)
+
+	local eyeColor = if enemy.unparryable then Color3.fromRGB(255, 42, 42) else Color3.fromRGB(255, 152, 72)
+	for _, eye in presentation.eyes do
+		eye.Color = eyeColor
+	end
+end
+
+-- Disarms the tell. The orb is gone the same frame the blade starts moving.
+local function clearTelegraphGlow(enemy: Enemy)
+	local presentation = enemy.presentation
+
+	local tween = presentation.orbTween
+	if tween then
+		tween:Cancel()
+		presentation.orbTween = nil
+	end
+
+	presentation.emitter.Rate = 0
+	presentation.orb.Transparency = 1
+	presentation.orb.Size = Vector3.new(0.95, 0.95, 0.95)
+
+	for _, eye in presentation.eyes do
+		eye.Color = enemy.archetype.eyeColor
+	end
+end
 
 local function clearTelegraph(enemy: Enemy)
 	if not enemy.telegraphActive then
 		return
 	end
 	enemy.telegraphActive = false
+	clearTelegraphGlow(enemy)
 	enemy.model:SetAttribute(ATTR.TelegraphEnds, nil)
 	enemy.model:SetAttribute(ATTR.TelegraphParryable, nil)
 	enemy.model:SetAttribute(ATTR.TelegraphLabel, nil)
@@ -269,6 +559,10 @@ local function beginTelegraph(enemy: Enemy, duration: number)
 	enemy.model:SetAttribute(ATTR.TelegraphEnds, endsAt)
 	enemy.model:SetAttribute(ATTR.TelegraphParryable, not enemy.unparryable)
 	enemy.model:SetAttribute(ATTR.TelegraphLabel, if enemy.unparryable then TELEGRAPH.UnparryableLabel else TELEGRAPH.ParryableLabel)
+
+	-- Feet plant and the stride drops out: that stillness is part of the tell.
+	haltLocomotion(enemy)
+	armTelegraphGlow(enemy)
 
 	local katana = enemy.katana
 	if katana then
@@ -284,6 +578,7 @@ end
 
 local function stun(enemy: Enemy, duration: number)
 	clearTelegraph(enemy)
+	haltLocomotion(enemy)
 	enemy.phase = "Stun"
 	enemy.timer = duration
 	enemy.stunUntil = os.clock() + duration
@@ -301,6 +596,7 @@ end
 local function stagger(enemy: Enemy)
 	local timestamp = os.clock()
 	clearTelegraph(enemy)
+	haltLocomotion(enemy)
 	enemy.phase = "Stagger"
 	enemy.timer = STAGGER_TIME
 	enemy.staggerUntil = timestamp + STAGGER_TIME
@@ -416,10 +712,8 @@ local function resolveStrike(enemy: Enemy)
 	local katana = enemy.katana
 	if katana then
 		KatanaFactory.poseArm(katana, POSES.EnemyStrike)
-		KatanaFactory.setTrail(katana, true)
-		task.delay(0.12, function()
-			KatanaFactory.setTrail(katana, false)
-		end)
+		-- The blade burns for the cut itself and is dark again right after.
+		KatanaFactory.pulseTrail(katana, 0.12, enemy.archetype.glowColor)
 	end
 
 	if not hitSomething then
@@ -458,14 +752,17 @@ local function moveToward(enemy: Enemy, targetRoot: BasePart, deltaTime: number)
 	local desired = targetPosition - toward * (enemy.archetype.attackRange * 0.8) + right * enemy.orbit
 	desired = Vector3.new(desired.X, current.Y, desired.Z)
 
+	local speed = enemy.archetype.moveSpeed * enemy.speedMultiplier
 	local delta = desired - current
 	local distance = delta.Magnitude
 	if distance > 0.08 then
-		local speed = enemy.archetype.moveSpeed * enemy.speedMultiplier
 		local travel = math.min(distance, speed * deltaTime)
 		local nextPosition = current + delta.Unit * travel
 		enemy.root.CFrame = CFrame.lookAt(nextPosition, nextPosition + toward)
 	end
+
+	-- Legs follow the steering: authored clip first, procedural stride otherwise.
+	driveLocomotion(enemy, deltaTime, speed / RUN_SPEED_REFERENCE)
 end
 
 local function faceTarget(enemy: Enemy, targetPosition: Vector3, deltaTime: number, rate: number)
@@ -493,6 +790,9 @@ local function updateEnemy(enemy: Enemy, deltaTime: number)
 
 	if enemy.phase == "Dead" or enemy.phase == "Stun" or enemy.phase == "Stagger" then
 		-- Stun/Stagger poses are applied once on entry; here we only count down.
+		-- `katana` was previously read from an undefined global here, so the rest-pose
+		-- reset silently never ran; it is resolved from the enemy now.
+		local katana = enemy.katana
 		if enemy.timer > 0 then
 			enemy.timer -= deltaTime
 			if enemy.timer <= 0 and enemy.phase ~= "Dead" then
@@ -502,6 +802,8 @@ local function updateEnemy(enemy: Enemy, deltaTime: number)
 				if katana then
 					KatanaFactory.resetArm(katana)
 				end
+				-- Recover from the stumble and pick the stride back up.
+				enemy.stridePhase = 0
 			end
 		end
 		return
@@ -633,6 +935,9 @@ local function killEnemy(enemy: Enemy)
 	end
 	enemy.phase = "Dead"
 	clearTelegraph(enemy)
+	clearTelegraphGlow(enemy)
+	haltLocomotion(enemy)
+	Animations.forget(enemy.model)
 	CollectionService:RemoveTag(enemy.model, TAG)
 	enemy.model:SetAttribute(ATTR.StunnedUntil, 0)
 	enemy.model:SetAttribute(ATTR.StaggeredUntil, 0)
@@ -667,7 +972,7 @@ local function spawnEnemy(request: Remotes.SpawnRequest): Enemy?
 	end
 
 	local health = archetype.health * (if request.healthMultiplier > 0 then request.healthMultiplier else 1)
-	local model, humanoid, root = createRig(archetype, request.origin, request.lookAt)
+	local model, humanoid, root, presentation = createRig(archetype, request.origin, request.lookAt)
 	humanoid.MaxHealth = health
 	humanoid.Health = health
 
@@ -675,6 +980,7 @@ local function spawnEnemy(request: Remotes.SpawnRequest): Enemy?
 		model = model,
 		humanoid = humanoid,
 		root = root,
+		presentation = presentation,
 		katana = nil,
 		archetype = archetype,
 		phase = "Spawn",
@@ -690,6 +996,10 @@ local function spawnEnemy(request: Remotes.SpawnRequest): Enemy?
 		speedMultiplier = request.speedMultiplier,
 		wave = request.wave,
 		telegraphActive = false,
+		-- A random start phase keeps a pack from striding in lockstep.
+		locomotion = nil,
+		stridePhase = math.random() * math.pi * 2,
+		strideActive = false,
 	}
 
 	model:SetAttribute(ATTR.Poise, archetype.poise)
@@ -700,6 +1010,12 @@ local function spawnEnemy(request: Remotes.SpawnRequest): Enemy?
 	model:SetAttribute(ATTR.Wave, request.wave)
 
 	enemy.katana = KatanaFactory.attach(model)
+	local katana = enemy.katana
+	if katana then
+		-- Enemy steel burns in the archetype's colour; the ribbon starts dark.
+		KatanaFactory.setTrailColor(katana, archetype.glowColor)
+		KatanaFactory.setTrail(katana, false)
+	end
 	CollectionService:AddTag(model, TAG)
 
 	-- Spawn-in: fade the body up so a new wave never pops in out of nowhere.

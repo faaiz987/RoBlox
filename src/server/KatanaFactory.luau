@@ -21,7 +21,10 @@ export type Katana = {
 	model: Model,
 	handle: BasePart,
 	blade: BasePart,
+	-- Wide coloured ribbon; the swing tell everyone reads.
 	trail: Trail,
+	-- Thin white core inside the ribbon, which is what sells the "glowing blade".
+	coreTrail: Trail?,
 	grip: Motor6D,
 	hand: BasePart,
 	-- Motor6D that lifts the whole arm; nil for exotic custom rigs.
@@ -31,6 +34,8 @@ export type Katana = {
 }
 
 local RIG = CombatConfig.RigParts
+local TRAIL_CFG = CombatConfig.Trail
+local TRAIL_COLOR = CombatConfig.Fx.SlashColor
 
 type Pose = CombatConfig.Vector3Pose
 
@@ -116,6 +121,68 @@ local function resolveShoulder(katana: Katana): Motor6D?
 end
 
 -- ---------------------------------------------------------------------------
+-- Blade glow
+--   A katana carries two ribbons across its edge: a wide coloured one and a thin
+--   white core. Both sit inert until a swing switches them on -- so 34 idle
+--   enemies cost nothing -- and both are repaired on demand, which means a blade
+--   built by an older revision still ends up glowing.
+-- ---------------------------------------------------------------------------
+
+-- Applies the shared ribbon look. `color` nil keeps whatever the blade had.
+local function applyTrailLook(trail: Trail, color: Color3?, width: number, transparency: number)
+	trail.Lifetime = TRAIL_CFG.Lifetime
+	trail.MinLength = 0.1
+	trail.FaceCamera = true
+	trail.LightEmission = TRAIL_CFG.LightEmission
+	if color then
+		trail.Color = ColorSequence.new(color)
+	end
+	trail.WidthScale = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, width),
+		NumberSequenceKeypoint.new(1, width * 0.15),
+	})
+	trail.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, transparency),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+end
+
+--[[
+	Adds the white core ribbon if it is missing.
+	The clone keeps the hilt/tip attachments, so both ribbons sweep the same arc.
+]]
+local function ensureCoreTrail(katana: Katana): Trail?
+	local existing = katana.coreTrail
+	if existing and existing.Parent then
+		return existing
+	end
+
+	local found: Instance? = katana.blade:FindFirstChild("SlashTrailCore")
+	if not found then
+		local clone = katana.trail:Clone()
+		clone.Name = "SlashTrailCore"
+		clone.Enabled = false
+		clone.Parent = katana.blade
+		found = clone
+	end
+	if not found:IsA("Trail") then
+		return nil
+	end
+
+	applyTrailLook(found, TRAIL_CFG.CoreColor, TRAIL_CFG.CoreWidthScale, TRAIL_CFG.CoreTransparency)
+	katana.coreTrail = found
+	return found
+end
+
+-- Brings an adopted or freshly built blade up to the current glow spec.
+local function ensureGlow(katana: Katana)
+	if katana.trail.Parent then
+		applyTrailLook(katana.trail, nil, 1, 0.25)
+	end
+	ensureCoreTrail(katana)
+end
+
+-- ---------------------------------------------------------------------------
 -- Rig discovery
 -- ---------------------------------------------------------------------------
 
@@ -152,6 +219,7 @@ local function describe(model: Model, hand: BasePart): Katana?
 	local handle = model:FindFirstChild("Handle")
 	local blade = model:FindFirstChild("Blade")
 	local trail = blade and blade:FindFirstChild("SlashTrail")
+	local core = blade and blade:FindFirstChild("SlashTrailCore")
 	local grip = hand:FindFirstChild(RIG.KatanaGripName)
 	if not (handle and handle:IsA("BasePart") and blade and blade:IsA("BasePart")) then
 		return nil
@@ -161,16 +229,20 @@ local function describe(model: Model, hand: BasePart): Katana?
 	end
 	local character = model.Parent
 	local shoulder = if character then KatanaFactory.findShoulderJoint(character) else nil
-	return {
+	local katana: Katana = {
 		model = model,
 		handle = handle,
 		blade = blade,
 		trail = trail,
+		coreTrail = if core and core:IsA("Trail") then core else nil,
 		grip = grip,
 		hand = hand,
 		shoulder = shoulder,
 		baseShoulderC0 = if shoulder then shoulder.C0 else nil,
 	}
+	-- Adopted blades are repaired here: an older revision shipped one ribbon only.
+	ensureGlow(katana)
+	return katana
 end
 
 --[[
@@ -243,19 +315,7 @@ function KatanaFactory.attach(character: Model): Katana?
 	trail.Name = "SlashTrail"
 	trail.Attachment0 = hiltAttachment
 	trail.Attachment1 = tipAttachment
-	trail.Lifetime = 0.16
-	trail.MinLength = 0.1
-	trail.FaceCamera = true
-	trail.LightEmission = 0.35
-	trail.WidthScale = NumberSequence.new({
-		NumberSequenceKeypoint.new(0, 1),
-		NumberSequenceKeypoint.new(1, 0.15),
-	})
-	trail.Transparency = NumberSequence.new({
-		NumberSequenceKeypoint.new(0, 0.25),
-		NumberSequenceKeypoint.new(1, 1),
-	})
-	trail.Color = ColorSequence.new(CombatConfig.Fx.SlashColor)
+	applyTrailLook(trail, TRAIL_COLOR, 1, 0.25)
 	trail.Enabled = false
 	trail.Parent = blade
 
@@ -265,11 +325,14 @@ function KatanaFactory.attach(character: Model): Katana?
 		handle = handle,
 		blade = blade,
 		trail = trail,
+		coreTrail = nil,
 		grip = grip,
 		hand = hand,
 		shoulder = shoulder,
 		baseShoulderC0 = if shoulder then shoulder.C0 else nil,
 	}
+	-- Mints the hot core ribbon, so a fresh blade is already glowing on swing one.
+	ensureGlow(katana)
 	cache[character] = katana
 	return katana
 end
@@ -307,18 +370,46 @@ function KatanaFactory.ensureWeld(character: Model): boolean
 	return true
 end
 
--- Turns the blade's ribbon on/off (server side, replicates to everyone).
+-- Turns both blade ribbons on/off (server side, replicates to everyone).
 function KatanaFactory.setTrail(katana: Katana, enabled: boolean)
-	if katana.trail.Parent == nil then
-		return
+	if katana.trail.Parent ~= nil then
+		katana.trail.Enabled = enabled
 	end
-	katana.trail.Enabled = enabled
+	local core = katana.coreTrail
+	if core and core.Parent ~= nil then
+		core.Enabled = enabled
+	end
 end
 
--- Recolours the ribbon, e.g. purple while Shadow Dash is active.
+-- Recolours the ribbon, e.g. purple while the Shadow Dash is active.
 function KatanaFactory.setTrailColor(katana: Katana, color: Color3)
 	katana.trail.Color = ColorSequence.new(color)
 end
+
+--[[
+	One-shot swing glow: switch the ribbons on now, switch them off after
+	`duration`. Every server-side swing routes through here, and the delayed
+	switch-off is what guarantees an idle blade is dark after a dropped code path.
+]]
+function KatanaFactory.pulseTrail(katana: Katana, duration: number, color: Color3?)
+	if color then
+		KatanaFactory.setTrailColor(katana, color)
+	end
+	KatanaFactory.setTrail(katana, true)
+	if duration <= 0 then
+		return
+	end
+	local blade = katana.blade
+	task.delay(duration, function()
+		-- The blade may already be destroyed by a kill/despawn tween.
+		if blade.Parent ~= nil then
+			KatanaFactory.setTrail(katana, false)
+		end
+	end)
+end
+
+-- Exposed so other systems can repair a blade they adopted from the DataModel.
+KatanaFactory.ensureGlow = ensureGlow
 
 -- ---------------------------------------------------------------------------
 -- Posing API shared by EnemyAI (enemies) and the swing scheduler (players)

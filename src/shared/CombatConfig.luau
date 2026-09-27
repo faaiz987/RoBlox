@@ -71,8 +71,17 @@ export type EnemyArchetype = {
 	poiseRegen: number,
 	-- Chunkier enemies hit harder, resist knockback and glow differently.
 	knockbackResist: number,
+	-- Palette. The body reads as a shadow made of cloth; the trim and eyes carry
+	-- the archetype's glow so a pack is still readable at a distance.
 	bodyColor: Color3,
 	accentColor: Color3,
+	-- Arms and legs: one step darker than the torso.
+	limbColor: Color3,
+	-- Emissive eyes (Neon material).
+	eyeColor: Color3,
+	-- Emissive trim / katana ribbon colour.
+	glowColor: Color3,
+	bodyMaterial: Enum.Material,
 }
 
 export type Stats = {
@@ -226,8 +235,12 @@ CombatConfig.Enemies = {
 		poise = 40,
 		poiseRegen = 8,
 		knockbackResist = 0,
-		bodyColor = Color3.fromRGB(58, 54, 66),
+		bodyColor = Color3.fromRGB(38, 40, 50),
 		accentColor = Color3.fromRGB(196, 148, 82),
+		limbColor = Color3.fromRGB(29, 30, 38),
+		eyeColor = Color3.fromRGB(255, 58, 62),
+		glowColor = Color3.fromRGB(255, 74, 74),
+		bodyMaterial = Enum.Material.Fabric,
 	} :: EnemyArchetype,
 
 	Brute = {
@@ -244,8 +257,12 @@ CombatConfig.Enemies = {
 		poise = 90,
 		poiseRegen = 5,
 		knockbackResist = 0.65,
-		bodyColor = Color3.fromRGB(96, 40, 44),
+		bodyColor = Color3.fromRGB(54, 34, 36),
 		accentColor = Color3.fromRGB(214, 96, 62),
+		limbColor = Color3.fromRGB(40, 25, 27),
+		eyeColor = Color3.fromRGB(255, 84, 54),
+		glowColor = Color3.fromRGB(255, 96, 48),
+		bodyMaterial = Enum.Material.Slate,
 	} :: EnemyArchetype,
 
 	Shinobi = {
@@ -263,8 +280,12 @@ CombatConfig.Enemies = {
 		poise = 25,
 		poiseRegen = 12,
 		knockbackResist = 0.2,
-		bodyColor = Color3.fromRGB(34, 38, 48),
+		bodyColor = Color3.fromRGB(26, 30, 40),
 		accentColor = Color3.fromRGB(126, 208, 244),
+		limbColor = Color3.fromRGB(20, 24, 32),
+		eyeColor = Color3.fromRGB(255, 58, 62),
+		glowColor = Color3.fromRGB(126, 208, 244),
+		bodyMaterial = Enum.Material.Fabric,
 	} :: EnemyArchetype,
 }
 
@@ -333,13 +354,19 @@ CombatConfig.Tags = {
 -- ---------------------------------------------------------------------------
 
 CombatConfig.Arena = {
-	-- Height of an enemy's root so its feet land on the baseplate.
+	-- Height of an enemy's root so its feet land on the arena floor.
 	RigRootY = 3,
 	-- Wave enemies appear on a ring between these distances from a defendant.
 	SpawnMinDistance = 44,
 	SpawnMaxDistance = 62,
 	-- Hard ceiling so a late wave cannot melt the server.
 	MaxAlive = 34,
+	-- Geometry, read by EnvironmentSetup when it builds the stage. The floor must
+	-- out-reach SpawnMaxDistance or enemies would spawn off the edge.
+	Radius = 78,
+	BoundaryRadius = 70,
+	TileSize = 12,
+	WallHeight = 14,
 }
 
 --[[
@@ -349,8 +376,31 @@ CombatConfig.Arena = {
 CombatConfig.RigParts = {
 	HandNames = { "RightHand", "Right Arm" },
 	ShoulderJointNames = { "RightShoulder", "Right Shoulder" },
+	-- R15 only: R6 rigs have no elbow or waist joint, so those limbs simply stay
+	-- rigid and the shoulder carries the whole swing.
+	ElbowJointNames = { "RightElbow", "Right Elbow" },
+	WaistJointNames = { "Waist", "RootJoint" },
 	KatanaName = "Katana",
 	KatanaGripName = "KatanaGrip",
+}
+
+--[[
+	Procedural swing rig.
+	The pose tables above only carry shoulder angles, which on their own make a stiff
+	"one-bone" attack. These numbers are what turn that into a cut: the forearm folds
+	on the windup and drives out on the impact, and the torso turns away and then
+	through the swing. Flip a sign here if a rig reads backwards.
+]]
+CombatConfig.SwingRig = {
+	-- Fold of the forearm during the windup, in degrees.
+	ElbowFold = 58,
+	-- Forearm at the impact: just short of straight.
+	ElbowExtend = -6,
+	-- Guard hold: blade brought across the body.
+	ElbowGuard = 74,
+	-- Torso turn away from the target on the windup, then through it on the cut.
+	WaistBack = -14,
+	WaistThrough = 18,
 }
 
 -- ---------------------------------------------------------------------------
@@ -384,6 +434,72 @@ CombatConfig.Poses = {
 -- Presentation
 -- ---------------------------------------------------------------------------
 
+-- ---------------------------------------------------------------------------
+-- Animation assets
+--   Every id is optional. An empty string means "no clip authored yet", and the
+--   caller falls back to the procedural Motor6D posing instead of trying to load
+--   a dead asset -- so the game animates correctly the moment it is synced.
+-- ---------------------------------------------------------------------------
+
+CombatConfig.Animations = {
+	-- R15 clips. R15 clips cannot drive an R6 rig: those rigs use PlayerR6 and then
+	-- fall back to the procedural swing.
+	Player = {
+		Slash1 = "",
+		Slash2 = "",
+		Heavy = "",
+		Guard = "",
+		Parry = "",
+	} :: { [string]: string },
+
+	-- Optional R6 variants, used when the local avatar is R6.
+	PlayerR6 = {
+		Slash1 = "",
+		Slash2 = "",
+		Heavy = "",
+	} :: { [string]: string },
+
+	-- Enemy clips. The wave rigs are R6 and script-driven, so these are additive:
+	-- when they are empty EnemyAI plays its procedural stride instead.
+	Enemy = {
+		Walk = "",
+		Run = "",
+		Windup = "",
+		Strike = "",
+		Stagger = "",
+	} :: { [string]: string },
+
+	-- When no id is configured, an `Animation` instance carrying one of these names
+	-- under the character is used instead -- the drag-and-drop way to ship anims.
+	Aliases = {
+		Slash1 = { "Slash1", "SlashA", "RisingCut" },
+		Slash2 = { "Slash2", "SlashB", "CrossedSteel" },
+		Heavy = { "Heavy", "Slash3", "HeavensFall", "Finisher" },
+		Guard = { "Guard", "Block", "ParryGuard" },
+		Parry = { "Parry", "Riposte" },
+		Walk = { "Walk", "WalkAnim" },
+		Run = { "Run", "RunAnim", "Sprint" },
+		Windup = { "Windup", "WindUp", "Telegraph" },
+		Strike = { "Strike", "Attack", "EnemySlash" },
+		Stagger = { "Stagger", "Hit", "Impact" },
+	} :: { [string]: { string } },
+
+	-- Default blend in/out for a combat track, in seconds.
+	FadeTime = 0.08,
+}
+
+-- Katana ribbon presentation; KatanaFactory owns the instances.
+CombatConfig.Trail = {
+	-- Seconds a blade segment lingers: long enough to read, short enough to snap.
+	Lifetime = 0.16,
+	-- 1 feeds the ribbon into Bloom, which is what makes the blade read as glowing.
+	LightEmission = 1,
+	-- Thin white core drawn inside the coloured ribbon.
+	CoreColor = Color3.fromRGB(255, 255, 255),
+	CoreWidthScale = 0.4,
+	CoreTransparency = 0.2,
+}
+
 CombatConfig.Fx = {
 	SlashColor = Color3.fromRGB(228, 236, 245),
 	ParryColor = Color3.fromRGB(255, 214, 108),
@@ -404,10 +520,38 @@ CombatConfig.Camera = {
 	BaseFov = 70,
 	-- FOV spring: how fast the camera returns to rest (higher = snappier).
 	FovRecovery = 7,
-	-- Trauma decay per second.
-	ShakeDecay = 1.35,
-	MaxShakeDegrees = 6,
-	MaxShakeOffset = 0.55,
+	-- Trauma decay per second. Faster decay = the camera settles between swings.
+	ShakeDecay = 2.2,
+	MaxShakeDegrees = 2.6,
+	MaxShakeOffset = 0.2,
+
+	--[[
+		Global feel multipliers, applied to every kick the client raises (swing,
+		impact, parry, hit, death). Melee puts the camera very close to the action, so
+		these exist as the first dial to turn when the picture feels busy -- they scale
+		the whole camera language at once instead of retuning each call site.
+	]]
+	ShakeScale = 0.6,
+	RollScale = 0.55,
+	FovScale = 0.7,
+	-- The shake's roll (Z) axis reads as nausea rather than impact; damp it harder.
+	ShakeRollDamping = 0.35,
+
+	--[[
+		Mouse-look lock: the camera follows raw mouse movement with no right-click
+		hold (MouseBehavior.LockCenter), and the cursor is handed straight back the
+		moment a menu takes over.
+	]]
+	Lock = {
+		MinZoom = 5,
+		MaxZoom = 16,
+		DefaultZoom = 11,
+		HideCursor = true,
+		-- A ScreenGui flagged with this attribute (value `true`) also frees the cursor.
+		MenuAttribute = "CB_Menu",
+		-- How often the lock is re-asserted, in seconds. Cheap enough to be tiny.
+		RepairInterval = 0.25,
+	},
 }
 
 -- ---------------------------------------------------------------------------

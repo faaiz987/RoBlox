@@ -18,6 +18,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local SoundService = game:GetService("SoundService")
+local UserInputService = game:GetService("UserInputService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local CombatConfig = require(Shared:WaitForChild("CombatConfig"))
@@ -55,7 +56,70 @@ local playerGui = player:WaitForChild("PlayerGui")
 local choiceRemote = Remotes.client(NAMES.PerkChoice)
 local grantedRemote = Remotes.client(NAMES.PerkGranted)
 local waveRemote = Remotes.client(NAMES.WaveState)
-local selectPerkRemote = Remotes.client(NAMES.SelectPerk)
+
+--[[
+	The perk-select remote, resolved lazily and re-resolved on every pick.
+
+	`Remotes.client` is authoritative (it waits for replication, then creates a
+	placeholder of last resort), but it *errors* when it cannot resolve -- and a card
+	click is the worst possible place for an error, because that is the exact click
+	that has to hide the overlay. So: try the registry, then the replicated folder by
+	name, and hand back nil rather than throwing.
+]]
+local selectPerkRemote: RemoteEvent? = nil
+
+-- The registry name is "SelectPerk"; earlier builds of the place shipped it as
+-- "SelectPerkEvent". Both are accepted so a stale Studio copy still picks perks.
+local SELECT_NAMES = { NAMES.SelectPerk, "SelectPerkEvent" }
+
+local function resolveSelectPerk(): RemoteEvent?
+	local cached = selectPerkRemote
+	if cached and cached.Parent then
+		return cached
+	end
+
+	local resolved: RemoteEvent? = nil
+	local ok = pcall(function()
+		resolved = Remotes.client(NAMES.SelectPerk)
+	end)
+
+	if not ok or not resolved then
+		local folder = ReplicatedStorage:FindFirstChild("Remotes")
+		if not folder then
+			folder = ReplicatedStorage:WaitForChild("Remotes", 5)
+		end
+		if folder then
+			for _, name in SELECT_NAMES do
+				local found: Instance? = folder:FindFirstChild(name)
+				if not found and name == NAMES.SelectPerk then
+					found = folder:WaitForChild(name, 5)
+				end
+				if found and found:IsA("RemoteEvent") then
+					resolved = found
+					break
+				end
+			end
+		end
+	end
+
+	if resolved then
+		selectPerkRemote = resolved
+	end
+	return resolved
+end
+
+--[[
+	Hands the cursor back and forth between the choice UI and the combat camera.
+	`CB_ChoiceOpen` is the contract CombatController reads for its mouse lock, and
+the mouse behavior is flipped right here as well, so the very next frame is
+	already correct even before that loop ticks.
+]]
+local function setChoiceCursor(open: boolean)
+	player:SetAttribute(ATTR.ChoiceOpen, open)
+	UserInputService.MouseBehavior = if open then Enum.MouseBehavior.Default else Enum.MouseBehavior.LockCenter
+	-- Ignored while the mouse is locked; required the moment it is not.
+	UserInputService.MouseIconEnabled = true
+end
 
 local RARITY_COLORS: { [string]: Color3 } = {
 	Common = Color3.fromRGB(186, 196, 208),
@@ -339,15 +403,67 @@ type CardUi = {
 	index: number,
 }
 
+--[[
+	The selected-card flourish, in one place.
+	The click handler is deliberately thin: everything it calls is a local declared
+	*above* it, which is what removes the whole class of "attempt to call a nil
+	value" failures the card click used to produce.
+]]
+local function animateCardPick(ui: CardUi, card: Card)
+	-- Card data comes from the server, so the palette is validated rather than
+	-- trusted: a malformed card may look plain, but it can never throw on click.
+	local accent = if typeof(card.color) == "Color3" then card.color else PALETTE.Accent
+
+	TweenService:Create(ui.scale, TweenInfo.new(0.18, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1.12 }):Play()
+	TweenService:Create(
+		ui.root,
+		TweenInfo.new(0.18),
+		{ BackgroundColor3 = accent:Lerp(PALETTE.Ink, 0.2) }
+	):Play()
+	playLocalSound(CombatConfig.Fx.PerkSelect, 0.6, 1.2)
+end
+
 local cards: { CardUi } = {}
 local choiceOpen = false
 local picking = false
 local currentCards: { Card } = {}
 
--- Forward declaration: buildCard's Activated handler closes over this, so it
--- must exist as a local *before* the cards are built (a later `local function`
--- would be read as a nil global at click time and the overlay would never hide).
-local closeChoice: (Card?) -> ()
+--[[	Single exit path for the choice overlay.
+
+	It is a *defined* local here -- never a forward declaration, never an assignment
+	parked after the card loop -- because the click handler below closes over it, and
+	a nil value at that call site is exactly the crash this file used to ship. Hiding
+	is instant: a pick must never strand the overlay over the arena.
+]]
+local function closeChoice(chosen: Card?)
+	choiceOpen = false
+	picking = false
+
+	-- Cursor back to the combat camera before anything else touches the GUI.
+	setChoiceCursor(false)
+
+	-- One switch drops every card and the backdrop, so nothing is left mid-tween on
+	-- a hidden ScreenGui and the next wave opens from a clean slate.
+	choiceGui.Enabled = false
+	overlay.Visible = false
+	overlay.BackgroundTransparency = 1
+
+	for _, ui in cards do
+		ui.root.Active = false
+		ui.root.Selectable = false
+		ui.root.Visible = false
+		ui.root.BackgroundTransparency = 0
+		ui.root.BackgroundColor3 = PALETTE.Panel
+		ui.root.Position = UDim2.fromOffset(0, 26)
+		ui.scale.Scale = 1
+	end
+
+	if chosen then
+		local accent = if typeof(chosen.color) == "Color3" then chosen.color else PALETTE.Accent
+		-- The HUD lives on its own ScreenGui, so the toast survives the hide.
+		announce(`{string.upper(chosen.title)} CLAIMED`, accent)
+	end
+end
 
 local function buildCard(index: number): CardUi
 	local root = Instance.new("TextButton")
@@ -476,12 +592,27 @@ local function buildCard(index: number): CardUi
 			other.root.Selectable = false
 		end
 
-		-- Instant feedback before the overlay drops away.
-		playLocalSound(CombatConfig.Fx.PerkSelect, 0.6, 1.2)
-		TweenService:Create(scale, TweenInfo.new(0.18, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1.12 }):Play()
-		TweenService:Create(root, TweenInfo.new(0.18), { BackgroundColor3 = card.color:Lerp(PALETTE.Ink, 0.2) }):Play()
+		--[[
+			The pick, in three guarded beats:
+			  1. local feedback (sound + card pop) -- every target is a local defined above
+			  2. server intent -- a missing remote warns instead of taking the click down
+			  3. instant teardown + cursor handback, which runs even if 1 or 2 blew up
+		]]
+		local ok, err = pcall(function()
+			animateCardPick(ui, card)
 
-		selectPerkRemote:FireServer(card.id)
+			local remote = resolveSelectPerk()
+			if remote then
+				remote:FireServer(card.id)
+			else
+				warn("[PerkUI] SelectPerk remote unavailable; the perk was not sent to the server.")
+			end
+		end)
+		if not ok then
+			warn(`[PerkUI] card pick failed: {err}`)
+		end
+
+		-- Unconditional: the overlay must never survive a click.
 		closeChoice(card)
 	end)
 
@@ -496,40 +627,12 @@ end
 -- Choice lifecycle
 -- ---------------------------------------------------------------------------
 
-closeChoice = function(chosen: Card?)
-	choiceOpen = false
-	player:SetAttribute(ATTR.ChoiceOpen, false)
-
-	for _, ui in cards do
-		ui.root.Active = false
-		ui.root.Selectable = false
-		TweenService:Create(ui.scale, TweenInfo.new(0.2), { Scale = if chosen and ui.selectedId == chosen.id then 1.2 else 0.9 }):Play()
-		TweenService:Create(ui.root, TweenInfo.new(0.25), { BackgroundTransparency = 0.4 }):Play()
-	end
-
-	TweenService:Create(overlay, TweenInfo.new(0.3), { BackgroundTransparency = 1 }):Play()
-	task.delay(0.3, function()
-		overlay.Visible = false
-		-- ScreenGui-level hide: one switch drops every card and the backdrop.
-		choiceGui.Enabled = false
-		for _, ui in cards do
-			ui.root.BackgroundTransparency = 0
-			ui.root.BackgroundColor3 = PALETTE.Panel
-			ui.scale.Scale = 1
-		end
-	end)
-
-	if chosen then
-		announce(`{string.upper(chosen.title)} CLAIMED`, chosen.color)
-	end
-	picking = false
-end
-
 local function openChoice(payload: ChoicePayload)
 	currentCards = payload.cards
 	choiceOpen = true
 	picking = false
-	player:SetAttribute(ATTR.ChoiceOpen, true)
+	-- Frees the cursor for the cards and tells the camera to stop mouse-looking.
+	setChoiceCursor(true)
 
 	overlaySubtitle.Text = `Wave {payload.wave} cleared. Claim one boon before the next assault.`
 	choiceGui.Enabled = true
