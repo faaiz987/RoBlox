@@ -12,6 +12,7 @@
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
 local CombatConfig = require(ReplicatedStorage.Shared.CombatConfig)
 
 local KatanaFactory = {}
@@ -91,6 +92,27 @@ local function newAttachment(name: string, point: Vector3, parent: Instance): At
 	attachment.Position = point
 	attachment.Parent = parent
 	return attachment
+end
+
+--[[
+	Resolves the shoulder joint lazily, caching it on the katana the first time it
+	is found. A rig whose arms replicate a frame late therefore still animates
+	instead of being stuck with a nil joint forever.
+]]
+local function resolveShoulder(katana: Katana): Motor6D?
+	if katana.shoulder and katana.shoulder.Parent then
+		return katana.shoulder
+	end
+	local character = katana.model.Parent
+	if not character or not character:IsA("Model") then
+		return nil
+	end
+	local shoulder = KatanaFactory.findShoulderJoint(character)
+	if shoulder then
+		katana.shoulder = shoulder
+		katana.baseShoulderC0 = shoulder.C0
+	end
+	return katana.shoulder
 end
 
 -- ---------------------------------------------------------------------------
@@ -176,6 +198,17 @@ function KatanaFactory.attach(character: Model): Katana?
 
 	local hand = KatanaFactory.findHand(character)
 	if not hand then
+		-- Rigs can replicate limb-by-limb; give the right hand a bounded moment
+		-- before giving up, so the blade is never left unattached.
+		for _, handName in RIG.HandNames do
+			local part = character:WaitForChild(handName, 2)
+			if part and part:IsA("BasePart") then
+				hand = part
+				break
+			end
+		end
+	end
+	if not hand then
 		return nil
 	end
 
@@ -246,6 +279,34 @@ function KatanaFactory.get(character: Model): Katana?
 	return KatanaFactory.attach(character)
 end
 
+--[[
+	Repairs the grip weld if it is missing or malformed (e.g. a partially
+	replicated rig). Safe to call repeatedly; a healthy weld is left untouched.
+]]
+function KatanaFactory.ensureWeld(character: Model): boolean
+	local cached = cache[character]
+	if not cached or cached.model.Parent ~= character then
+		cached = KatanaFactory.attach(character)
+	end
+	if not cached then
+		return false
+	end
+	local katana: Katana = cached
+
+	local hand = KatanaFactory.findHand(character) or katana.hand
+	local existing = hand:FindFirstChild(RIG.KatanaGripName)
+	if existing and existing:IsA("Motor6D") and existing.Part0 == hand and existing.Part1 == katana.handle then
+		katana.grip = existing
+		return true
+	end
+	if existing then
+		existing:Destroy()
+	end
+
+	katana.grip = newMotor(RIG.KatanaGripName, hand, katana.handle, GRIP_OFFSET)
+	return true
+end
+
 -- Turns the blade's ribbon on/off (server side, replicates to everyone).
 function KatanaFactory.setTrail(katana: Katana, enabled: boolean)
 	if katana.trail.Parent == nil then
@@ -269,7 +330,7 @@ end
 	rotation always pivots where the rig's own joint is -- R6 and R15 both work.
 ]]
 function KatanaFactory.poseArm(katana: Katana, pose: Pose)
-	local shoulder = katana.shoulder
+	local shoulder = resolveShoulder(katana)
 	local base = katana.baseShoulderC0
 	if not shoulder or not base then
 		return
@@ -283,7 +344,7 @@ end
 	through a single continuous arc instead of taking a slerp shortcut.
 ]]
 function KatanaFactory.blendArm(katana: Katana, pose: Pose, t: number)
-	local shoulder = katana.shoulder
+	local shoulder = resolveShoulder(katana)
 	local base = katana.baseShoulderC0
 	if not shoulder or not base then
 		return
@@ -294,10 +355,51 @@ end
 
 -- Restores the shoulder rest pose.
 function KatanaFactory.resetArm(katana: Katana)
-	local shoulder = katana.shoulder
+	local shoulder = resolveShoulder(katana)
 	if shoulder and katana.baseShoulderC0 then
 		shoulder.C0 = katana.baseShoulderC0
 	end
+end
+
+--[[
+	TweenService-driven arm pose, used as the procedural fallback when no arm
+	animation asset is available. Returns the live Tween so callers can cancel it.
+	Works against the rig's own C0, so R6 and R15 behave identically.
+]]
+function KatanaFactory.tweenArm(
+	katana: Katana,
+	pose: Pose,
+	duration: number,
+	easingStyle: Enum.EasingStyle?,
+	easingDirection: Enum.EasingDirection?
+): Tween?
+	local shoulder = resolveShoulder(katana)
+	local base = katana.baseShoulderC0
+	if not shoulder or not base then
+		return nil
+	end
+	local tween = TweenService:Create(
+		shoulder,
+		TweenInfo.new(
+			math.max(duration, 0.01),
+			easingStyle or Enum.EasingStyle.Quad,
+			easingDirection or Enum.EasingDirection.Out
+		),
+		{ C0 = base * CombatConfig.poseToCFrame(pose) }
+	)
+	tween:Play()
+	return tween
+end
+
+-- Full swing beat: windup pose, then recovery back to rest.
+function KatanaFactory.swingArm(katana: Katana, windup: Pose, recovery: number, windupDuration: number)
+	KatanaFactory.tweenArm(katana, windup, windupDuration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	task.delay(math.max(windupDuration, 0.01), function()
+		if katana.model.Parent == nil then
+			return
+		end
+		KatanaFactory.tweenArm(katana, { x = 0, y = 0, z = 0 }, math.max(recovery, 0.01), Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+	end)
 end
 
 -- Drops the cache entry when a character is destroyed.

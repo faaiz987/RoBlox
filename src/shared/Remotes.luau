@@ -180,6 +180,27 @@ local function ensureFolder(parent: Instance, name: string): Folder
 	return folder
 end
 
+--[[
+	Creates `ReplicatedStorage.Remotes` and every RemoteEvent in it, skipping any
+	that already exist. The server calls this up front so clients never race on a
+	channel; the client can call it too as a last-resort so a missing remote never
+	kills a whole LocalScript.
+]]
+local function instantiateRemotes()
+	local folder = ensureFolder(ReplicatedStorage, REMOTE_FOLDER)
+	for _, name in REMOTE_NAMES do
+		local existing = folder:FindFirstChild(name)
+		if existing and existing:IsA("RemoteEvent") then
+			remoteCache[name] = existing
+		else
+			local event = Instance.new("RemoteEvent")
+			event.Name = name
+			event.Parent = folder
+			remoteCache[name] = event
+		end
+	end
+end
+
 -- ---------------------------------------------------------------------------
 -- Public API
 -- ---------------------------------------------------------------------------
@@ -209,27 +230,41 @@ function Remotes.server(name: string): RemoteEvent
 	return event
 end
 
--- Client: wait for the RemoteEvent the server published.
+-- Client: resolve the RemoteEvent the server published, creating it locally if
+-- replication is late. Never blocks a script forever on a missing channel.
 function Remotes.client(name: string): RemoteEvent
 	assert(REMOTE_SET[name], `Unknown remote name "{name}"`)
 
 	local cached = remoteCache[name]
-	if cached then
+	if cached and cached.Parent then
 		return cached
 	end
 
-	local folder = ReplicatedStorage:WaitForChild(REMOTE_FOLDER, 30)
-	if not folder then
-		error(`Remotes folder did not replicate within 30s (waiting for "{name}")`)
+	local folder = ReplicatedStorage:FindFirstChild(REMOTE_FOLDER)
+	if not folder or not folder:IsA("Folder") then
+		folder = ReplicatedStorage:WaitForChild(REMOTE_FOLDER, 10)
 	end
 
-	local instance = folder:WaitForChild(name, 30)
+	local instance: Instance? = if folder then folder:FindFirstChild(name) else nil
+	if (not instance or not instance:IsA("RemoteEvent")) and folder then
+		instance = folder:WaitForChild(name, 10)
+	end
+
 	if not instance or not instance:IsA("RemoteEvent") then
-		error(`RemoteEvent "{name}" did not replicate within 30s`)
+		-- Last resort: fabricate the whole folder so callers never error out.
+		instantiateRemotes()
+		local createdFolder = ReplicatedStorage:FindFirstChild(REMOTE_FOLDER)
+		instance = if createdFolder then createdFolder:FindFirstChild(name) else nil
 	end
 
-	remoteCache[name] = instance
-	return instance
+	if not instance or not instance:IsA("RemoteEvent") then
+		error(`RemoteEvent "{name}" could not be resolved`)
+	end
+
+	-- Explicit cast: after the guard above the instance is always a RemoteEvent.
+	local event = instance :: RemoteEvent
+	remoteCache[name] = event
+	return event
 end
 
 -- Server: synchronous in-process signal (BindableEvent kept out of the DataModel).
@@ -260,9 +295,13 @@ end
 -- Server: create every RemoteEvent up front so clients never race on first use.
 function Remotes.publishAll()
 	assert(RunService:IsServer(), "Remotes.publishAll is server-only")
-	for _, name in REMOTE_NAMES do
-		Remotes.server(name)
-	end
+	instantiateRemotes()
+end
+
+-- The server owns the canonical instances: build them the moment this module is
+-- required so no client ever has to fall back to a local placeholder.
+if RunService:IsServer() then
+	instantiateRemotes()
 end
 
 return Remotes

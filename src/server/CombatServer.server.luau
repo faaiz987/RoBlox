@@ -572,9 +572,10 @@ selectPerkRemote.OnServerEvent:Connect(function(player: Player, perkId: unknown)
 	end
 
 	table.clear(state.offered)
-	if grantPerk(player, id :: PerkId) then
-		perkSelectedSignal:Fire(player)
-	end
+	grantPerk(player, id :: PerkId)
+	-- Release the wave gate even on a duplicate pick, so a stale card can never
+	-- stall WaveManager's intermission until its timeout.
+	perkSelectedSignal:Fire(player)
 end)
 
 -- Rolls a fresh hand of cards for every living player and opens the overlay.
@@ -637,6 +638,7 @@ local function onCharacterAdded(player: Player, state: PlayerState, character: M
 	humanoid.BreakJointsOnDeath = false
 
 	KatanaFactory.attach(character)
+	KatanaFactory.ensureWeld(character)
 	resetTransientState(player, state)
 
 	humanoid.Died:Connect(function()
