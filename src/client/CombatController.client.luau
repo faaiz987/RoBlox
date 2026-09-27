@@ -4,9 +4,12 @@
 	-----------------------------
 	Everything the player *feels*:
 
-	  * Keybinds   -- Left Click: slash, F: parry / guard, Q or Shift: dodge.
-	  * Camera     -- trauma shake, FOV punches and swing roll, bound to render on
-	                  top of the default camera script.
+  * Keybinds   -- Left Click: slash, F: parry / guard, Q or Shift: dodge.
+  * Camera     -- mouse-look lock (no right-click hold) plus trauma shake, FOV
+                  punches and swing roll, bound to render on top of the default
+                  camera script. The cursor is freed for the perk overlay / menus.
+  * Animations -- authored R15/R6 slash clips via Humanoid.Animator when they are
+                  configured, with the procedural Motor6D swing as the fallback.
 	  * Sword      -- poses every katana in the world from replicated CombatFx, so
 	                  the local player and every observer see the same cut.
 	  * Telegraphs -- draws the enemy windup ring above each enemy from attributes.
@@ -26,15 +29,19 @@ local TweenService = game:GetService("TweenService")
 local Debris = game:GetService("Debris")
 local Lighting = game:GetService("Lighting")
 local SoundService = game:GetService("SoundService")
+local GuiService = game:GetService("GuiService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local CombatConfig = require(Shared:WaitForChild("CombatConfig"))
 local Remotes = require(Shared:WaitForChild("Remotes"))
+local Animations = require(Shared:WaitForChild("Animations"))
 
 local ATTR = CombatConfig.Attributes
 local POSES = CombatConfig.Poses
 local FXCFG = CombatConfig.Fx
 local CAMERA_CFG = CombatConfig.Camera
+local LOCK_CFG = CAMERA_CFG.Lock
+local TRAIL_CFG = CombatConfig.Trail
 local RIG = CombatConfig.RigParts
 local NAMES = Remotes.Names
 local TAG = CombatConfig.Tags.Enemy
@@ -61,6 +68,7 @@ type Fx = {
 }
 
 local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
 local camera = workspace.CurrentCamera
 
 local ACTIONS = {
@@ -127,6 +135,76 @@ local function myCharacter(): (Model?, Humanoid?, BasePart?)
 end
 
 -- ---------------------------------------------------------------------------
+-- Camera: mouse-look lock
+--   The mouse turns the camera with no right-click hold (MouseBehavior.LockCenter
+--   is exactly the "mouse look" mode the default camera script reads deltas from).
+--   The cursor is handed back the moment a menu wants it: the perk overlay flags
+--   itself through CB_ChoiceOpen, and any future menu can opt in by setting
+--   `CB_Menu = true` on its ScreenGui.
+-- ---------------------------------------------------------------------------
+
+local function menuIsOpen(): boolean
+	if player:GetAttribute(ATTR.ChoiceOpen) == true then
+		return true
+	end
+	-- A dead or absent character has nothing to aim: free the cursor instead.
+	local character = player.Character
+	local humanoid = if character then character:FindFirstChildOfClass("Humanoid") else nil
+	if not humanoid or humanoid.Health <= 0 then
+		return true
+	end
+	-- The Roblox menu and any focused TextBox own the cursor while they are up.
+	if GuiService.MenuIsOpen or UserInputService:GetFocusedTextBox() ~= nil then
+		return true
+	end
+	for _, gui in playerGui:GetChildren() do
+		if gui:IsA("ScreenGui") and gui.Enabled and gui:GetAttribute(LOCK_CFG.MenuAttribute) == true then
+			return true
+		end
+	end
+	return false
+end
+
+-- Converges mouse behavior onto the mode the current context wants.
+local function applyCameraLock()
+	local locked = not menuIsOpen()
+	local desired = if locked then Enum.MouseBehavior.LockCenter else Enum.MouseBehavior.Default
+	if UserInputService.MouseBehavior ~= desired then
+		UserInputService.MouseBehavior = desired
+	end
+
+	local wantIcon = (not locked) or (not LOCK_CFG.HideCursor)
+	if UserInputService.MouseIconEnabled ~= wantIcon then
+		UserInputService.MouseIconEnabled = wantIcon
+	end
+end
+
+-- Combat framing: classic third person, tight zoom so the duel stays in frame.
+local function applyCameraSetup()
+	player.CameraMode = Enum.CameraMode.Classic
+	player.CameraMinZoomDistance = LOCK_CFG.MinZoom
+	player.CameraMaxZoomDistance = LOCK_CFG.MaxZoom
+end
+
+local lockClock = 0
+
+RunService.Heartbeat:Connect(function(deltaTime: number)
+	-- Re-asserted on a slow timer: the engine resets MouseBehavior on state changes
+	-- (respawn, menu, chat) and a single write would not survive those.
+	lockClock += deltaTime
+	if lockClock >= LOCK_CFG.RepairInterval then
+		lockClock = 0
+		applyCameraLock()
+	end
+end)
+
+-- Menu transitions are instant: a click must never land on a locked camera.
+player:GetAttributeChangedSignal(ATTR.ChoiceOpen):Connect(applyCameraLock)
+
+applyCameraSetup()
+applyCameraLock()
+
+-- ---------------------------------------------------------------------------
 -- Camera FX: trauma shake + FOV punch + swing roll
 -- ---------------------------------------------------------------------------
 
@@ -136,16 +214,21 @@ local fovKick = 0
 local rollKick = 0
 local baseFov = camera.FieldOfView
 
+--[[
+	Camera kicks all route through these three helpers, which is why the global feel
+	multipliers live here: ShakeScale / FovScale / RollScale dial the entire camera
+	language from one place instead of needing every call site retuned.
+]]
 local function addTrauma(amount: number)
-	trauma = math.clamp(trauma + amount, 0, 1)
+	trauma = math.clamp(trauma + amount * CAMERA_CFG.ShakeScale, 0, 1)
 end
 
 local function addFov(degrees: number)
-	fovKick += degrees
+	fovKick += degrees * CAMERA_CFG.FovScale
 end
 
 local function addRoll(degrees: number)
-	rollKick += degrees
+	rollKick += degrees * CAMERA_CFG.RollScale
 end
 
 RunService:BindToRenderStep("CB_CameraFx", Enum.RenderPriority.Camera.Value + 1, function(deltaTime: number)
@@ -172,7 +255,8 @@ RunService:BindToRenderStep("CB_CameraFx", Enum.RenderPriority.Camera.Value + 1,
 		local shake = CFrame.Angles(
 			math.rad(shakeRng:NextNumber(-1, 1) * CAMERA_CFG.MaxShakeDegrees * amplitude),
 			math.rad(shakeRng:NextNumber(-1, 1) * CAMERA_CFG.MaxShakeDegrees * amplitude),
-			math.rad(shakeRng:NextNumber(-1, 1) * CAMERA_CFG.MaxShakeDegrees * amplitude)
+			-- Roll reads as nausea far sooner than pitch/yaw do, so it is damped.
+			math.rad(shakeRng:NextNumber(-1, 1) * CAMERA_CFG.MaxShakeDegrees * amplitude * CAMERA_CFG.ShakeRollDamping)
 		) * CFrame.new(
 			shakeRng:NextNumber(-1, 1) * CAMERA_CFG.MaxShakeOffset * amplitude,
 			shakeRng:NextNumber(-1, 1) * CAMERA_CFG.MaxShakeOffset * amplitude,
@@ -290,16 +374,21 @@ type SwordRig = {
 	shoulder: Motor6D?,
 	baseC0: CFrame?,
 	trail: Trail?,
+	-- White core ribbon inside the coloured one; created locally if the server's
+	-- blade replicated before the glow upgrade.
+	coreTrail: Trail?,
 }
 
 -- Mirrors KatanaFactory's grip frame so a client-side repair weld lines up.
 local GRIP_OFFSET = CFrame.new(0, 0.3, -0.1) * CFrame.Angles(math.rad(180), 0, 0)
 
 local swords: { [Model]: SwordRig } = {}
-local armTweens: { [Model]: Tween } = {}
+-- One list per character: a swing tweens several joints at once, and the next
+-- swing has to cancel all of them, not just the last one created.
+local armTweens: { [Model]: { Tween } } = {}
 
-local function findShoulder(character: Model): Motor6D?
-	for _, name in RIG.ShoulderJointNames do
+local function findJoint(character: Model, names: { string }): Motor6D?
+	for _, name in names do
 		for _, descendant in character:GetDescendants() do
 			if descendant:IsA("Motor6D") and descendant.Name == name then
 				return descendant
@@ -307,6 +396,55 @@ local function findShoulder(character: Model): Motor6D?
 		end
 	end
 	return nil
+end
+
+local function findShoulder(character: Model): Motor6D?
+	return findJoint(character, RIG.ShoulderJointNames)
+end
+
+--[[
+	The arm rig every swing pose is built from.
+
+	Deliberately independent of the katana: arms are what a player *sees* attack, so a
+	character whose blade has not replicated yet -- or a rig with no sword at all --
+	still swings. Joints resolve lazily, and each keeps the rest C0 captured at
+	resolve time, so repeated poses can never drift away from the idle stance.
+]]
+type ArmRig = {
+	shoulder: Motor6D?,
+	shoulderBase: CFrame?,
+	-- R15 only; nil on R6, which then swings from the shoulder alone.
+	elbow: Motor6D?,
+	elbowBase: CFrame?,
+	waist: Motor6D?,
+	waistBase: CFrame?,
+}
+
+local armRigs: { [Model]: ArmRig } = {}
+
+local function getArmRig(character: Model): ArmRig?
+	local cached = armRigs[character]
+	if cached and cached.shoulder and cached.shoulder.Parent and cached.shoulderBase then
+		return cached
+	end
+
+	local shoulder = findShoulder(character)
+	if not shoulder then
+		return nil
+	end
+	local elbow = findJoint(character, RIG.ElbowJointNames)
+	local waist = findJoint(character, RIG.WaistJointNames)
+
+	local rig: ArmRig = {
+		shoulder = shoulder,
+		shoulderBase = shoulder.C0,
+		elbow = elbow,
+		elbowBase = if elbow then elbow.C0 else nil,
+		waist = waist,
+		waistBase = if waist then waist.C0 else nil,
+	}
+	armRigs[character] = rig
+	return rig
 end
 
 local function findHand(character: Model): BasePart?
@@ -353,6 +491,38 @@ local function ensureKatanaWeld(character: Model)
 end
 
 --[[
+	Local repair for the blade's core ribbon.
+	Only the server owns the katana, but a missing ribbon is pure presentation: the
+	client may build its own copy without touching server state.
+]]
+local function ensureClientCoreTrail(blade: BasePart, trail: Trail): Trail?
+	local found = blade:FindFirstChild("SlashTrailCore")
+	if found and found:IsA("Trail") then
+		return found
+	end
+	if not trail.Attachment0 or not trail.Attachment1 then
+		return nil
+	end
+
+	local clone = trail:Clone()
+	clone.Name = "SlashTrailCore"
+	clone.Lifetime = TRAIL_CFG.Lifetime
+	clone.LightEmission = TRAIL_CFG.LightEmission
+	clone.Color = ColorSequence.new(TRAIL_CFG.CoreColor)
+	clone.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, TRAIL_CFG.CoreTransparency),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	clone.WidthScale = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, TRAIL_CFG.CoreWidthScale),
+		NumberSequenceKeypoint.new(1, TRAIL_CFG.CoreWidthScale * 0.15),
+	})
+	clone.Enabled = false
+	clone.Parent = blade
+	return clone
+end
+
+--[[
 	Resolves the sword rig for a character.
 	A rig is only memoized once its shoulder joint is known, so a character whose
 	arms replicate a frame late is re-resolved on the next swing instead of being
@@ -372,11 +542,18 @@ local function getSword(character: Model): SwordRig?
 	local trail = blade and blade:FindFirstChild("SlashTrail")
 	local shoulder = findShoulder(character)
 
+	local primary: Trail? = if trail and trail:IsA("Trail") then trail else nil
+	local core: Trail? = nil
+	if primary and blade and blade:IsA("BasePart") then
+		core = ensureClientCoreTrail(blade, primary)
+	end
+
 	local rig: SwordRig = {
 		model = model,
 		shoulder = shoulder,
 		baseC0 = if shoulder then shoulder.C0 else nil,
-		trail = if trail and trail:IsA("Trail") then trail else nil,
+		trail = primary,
+		coreTrail = core,
 	}
 	if shoulder and rig.baseC0 then
 		swords[character] = rig
@@ -388,15 +565,111 @@ local function poseCFrame(pose: Pose, alpha: number): CFrame
 	return CFrame.Angles(math.rad(pose.x * alpha), math.rad(pose.y * alpha), math.rad(pose.z * alpha))
 end
 
-local function setTrailEnabled(rig: SwordRig, enabled: boolean, duration: number?)
-	if not rig.trail then
-		return
+local REST_POSE: Pose = { x = 0, y = 0, z = 0 }
+local SWING_RIG = CombatConfig.SwingRig
+
+type JointTarget = { joint: Motor6D, goal: CFrame }
+
+--[[
+	Joint targets for one beat of a swing.
+	The shoulder angles come from the shared pose tables, which carry no forearm or
+torso information; the fold and the turn are added here from CombatConfig.SwingRig
+	so a clip-less swing reads as a cut instead of one stiff bone. Rigs without those
+	joints simply produce fewer targets.
+]]
+local function swingBeat(rig: ArmRig, pose: Pose, phase: string, alternate: boolean): { JointTarget }
+	local targets: { JointTarget } = {}
+
+	local shoulder = rig.shoulder
+	local shoulderBase = rig.shoulderBase
+	if shoulder and shoulderBase then
+		table.insert(targets, { joint = shoulder, goal = shoulderBase * poseCFrame(pose, 1) })
 	end
-	rig.trail.Enabled = enabled
-	if enabled and duration then
+
+	local elbow = rig.elbow
+	local elbowBase = rig.elbowBase
+	if elbow and elbowBase then
+		local fold = if phase == "Windup"
+			then SWING_RIG.ElbowFold
+			elseif phase == "Impact" then SWING_RIG.ElbowExtend
+			elseif phase == "Guard" then SWING_RIG.ElbowGuard
+			else 0
+		if alternate then
+			fold *= 0.75
+		end
+		table.insert(targets, { joint = elbow, goal = elbowBase * CFrame.Angles(math.rad(fold), 0, 0) })
+	end
+
+	local waist = rig.waist
+	local waistBase = rig.waistBase
+	if waist and waistBase then
+		local turn = if phase == "Windup"
+			then SWING_RIG.WaistBack
+			elseif phase == "Impact" then SWING_RIG.WaistThrough
+			else 0
+		if alternate then
+			turn *= -1
+		end
+		table.insert(targets, { joint = waist, goal = waistBase * CFrame.Angles(0, math.rad(turn), 0) })
+	end
+
+	return targets
+end
+
+-- Snaps a beat into place. The impact frame must never be tweened through.
+local function applyArmTargets(targets: { JointTarget })
+	for _, target in targets do
+		target.joint.C0 = target.goal
+	end
+end
+
+-- Tweened beat; throws nothing, so a rig without an elbow still swings.
+local function tweenArmTargets(
+	character: Model,
+	targets: { JointTarget },
+	duration: number,
+	style: Enum.EasingStyle,
+	direction: Enum.EasingDirection
+)
+	local tweens = armTweens[character]
+	if not tweens then
+		tweens = {}
+		armTweens[character] = tweens
+	end
+	for _, target in targets do
+		local tween = TweenService:Create(
+			target.joint,
+			TweenInfo.new(math.max(duration, 0.01), style, direction),
+			{ C0 = target.goal }
+		)
+		table.insert(tweens, tween)
+		tween:Play()
+	end
+end
+
+--[[
+	Switches both blade ribbons on/off.
+	`serial` is the swing that owns the ribbon: a newer cut cancels the older
+	switch-off, so a fast combo cannot leave a blade burning while it idles.
+]]
+local function setTrailEnabled(rig: SwordRig, enabled: boolean, duration: number?, serial: number?)
+	local function apply(state: boolean)
+		local trail = rig.trail
+		if trail and trail.Parent then
+			trail.Enabled = state
+		end
+		local core = rig.coreTrail
+		if core and core.Parent then
+			core.Enabled = state
+		end
+	end
+
+	apply(enabled)
+
+	if enabled and duration and duration > 0 then
 		task.delay(duration, function()
-			if rig.trail then
-				rig.trail.Enabled = false
+			if serial == nil or trailSerial[rig.model] == serial then
+				apply(false)
 			end
 		end)
 	end
@@ -404,11 +677,14 @@ end
 
 -- Cancels whatever arm tween is mid-flight for a character.
 local function cancelArmTween(character: Model)
-	local tween = armTweens[character]
-	if tween then
-		tween:Cancel()
-		armTweens[character] = nil
+	local tweens = armTweens[character]
+	if not tweens then
+		return
 	end
+	for _, tween in tweens do
+		tween:Cancel()
+	end
+	armTweens[character] = nil
 end
 
 local function ensureBladeAttachment(blade: BasePart, name: string, y: number): Attachment
@@ -460,87 +736,137 @@ local function spawnSlashArc(character: Model, color: Color3?)
 end
 
 --[[
-	Windup -> impact -> recovery, posed with TweenService on the shoulder Motor6D
-	so it works on both R6 ("Right Shoulder") and R15 ("RightShoulder"). This is
-	the procedural fallback when no arm animation asset is authored.
+	One swing, three beats: windup -> impact -> recovery.
+
+	An authored clip (see CombatConfig.Animations + the shared Animations module)
+	drives the arms when one is configured. Otherwise the swing is built from the rig
+	itself: shoulder rotation from the shared poses plus the forearm fold and torso
+turn from CombatConfig.SwingRig, so the attack reads as a cut rather than one stiff
+	bone. Works on R6 (shoulder only) and R15 (shoulder + elbow + waist). The blade's
+	ribbons and arc fire on the impact beat either way.
 ]]
 local function playSwing(character: Model, stepIndex: number, attackSpeed: number, color: Color3?)
-	local rig = getSword(character)
-	if not rig or not rig.shoulder or not rig.baseC0 then
-		-- No posable joints yet: still flash a blade arc so the cut reads.
-		spawnSlashArc(character, color)
-		return
-	end
-
 	local serial = (trailSerial[character] or 0) + 1
 	trailSerial[character] = serial
-	local baseC0 = rig.baseC0
-	local shoulder = rig.shoulder
 
 	local step = CombatConfig.getComboStep(stepIndex)
 	local speed = math.max(attackSpeed, 0.2)
 	local windup = math.max(step.windup / speed, 0.02)
 	local recovery = math.max(step.recovery / speed, 0.02)
 
+	local sword = getSword(character)
+	if sword and sword.trail and color then
+		sword.trail.Color = ColorSequence.new(color)
+	end
+
+	-- Ribbon + arc, fired on the beat the blade would connect.
+	local function impactBlade()
+		if sword then
+			setTrailEnabled(sword, true, math.min(0.16, recovery), serial)
+		end
+		spawnSlashArc(character, color)
+	end
+
+	-- A held guard stance yields the instant a swing starts.
+	Animations.stop(character, "Guard", 0.08)
+
+	-- 1. Authored clip: it owns the arms, so no tween may run beside it.
+	local clipKey = if step.kind == "Heavy"
+		then "Heavy"
+		elseif stepIndex % 2 == 0 then "Slash2"
+		else "Slash1"
+	local track = Animations.play(character, clipKey, "Player", 0.06, math.clamp(speed, 0.4, 3), 1)
+	if track then
+		cancelArmTween(character)
+		task.delay(windup, function()
+			if trailSerial[character] == serial then
+				impactBlade()
+			end
+		end)
+		task.delay(windup + recovery, function()
+			Animations.stop(character, clipKey, 0.16)
+		end)
+		return
+	end
+
+	-- 2. Procedural fallback: a dead asset id, an R6 rig with no R6 clip, or simply
+	-- no clips authored yet. Shoulder + forearm + torso, so the attack reads.
+	local armRig = getArmRig(character)
+	if not armRig then
+		-- No posable joints at all: still flash a blade arc so the cut reads.
+		spawnSlashArc(character, color)
+		return
+	end
+
+	local alternate = step.kind ~= "Heavy" and stepIndex % 2 == 0
 	local windupPose: Pose = if step.kind == "Heavy"
 		then POSES.HeavyWindup
-		elseif stepIndex % 2 == 0 then POSES.SlashAlternate
+		elseif alternate then POSES.SlashAlternate
 		else POSES.SlashWindup
 	local impactPose: Pose = if step.kind == "Heavy" then POSES.HeavyImpact else POSES.SlashImpact
 
-	if rig.trail and color then
-		rig.trail.Color = ColorSequence.new(color)
-	end
-
 	cancelArmTween(character)
-
-	local windupTween = TweenService:Create(
-		shoulder,
-		TweenInfo.new(windup, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-		{ C0 = baseC0 * poseCFrame(windupPose, 1) }
+	tweenArmTargets(
+		character,
+		swingBeat(armRig, windupPose, "Windup", alternate),
+		windup,
+		Enum.EasingStyle.Quad,
+		Enum.EasingDirection.Out
 	)
-	armTweens[character] = windupTween
-	windupTween:Play()
 
 	task.delay(windup, function()
 		if trailSerial[character] ~= serial then
 			return
 		end
 
-		-- Snap through the cut and fire trail + arc on the same beat.
-		shoulder.C0 = baseC0 * poseCFrame(impactPose, 1)
-		setTrailEnabled(rig, true, math.min(0.16, recovery))
-		spawnSlashArc(character, color)
-
-		local recoveryTween = TweenService:Create(
-			shoulder,
-			TweenInfo.new(recovery, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
-			{ C0 = baseC0 }
+		-- Snap through the cut, then ease home; the ribbon and arc fire on this beat.
+		applyArmTargets(swingBeat(armRig, impactPose, "Impact", alternate))
+		impactBlade()
+		tweenArmTargets(
+			character,
+			swingBeat(armRig, REST_POSE, "Rest", false),
+			recovery,
+			Enum.EasingStyle.Quart,
+			Enum.EasingDirection.Out
 		)
-		armTweens[character] = recoveryTween
-		recoveryTween:Play()
-		recoveryTween.Completed:Connect(function()
+		task.delay(recovery, function()
 			if trailSerial[character] == serial then
-				shoulder.C0 = baseC0
-			end
-			if armTweens[character] == recoveryTween then
-				armTweens[character] = nil
+				applyArmTargets(swingBeat(armRig, REST_POSE, "Rest", false))
 			end
 		end)
 	end)
 end
 
--- Guard / riposte poses for the local player, driven by input feel.
+--[[
+	Guard / riposte poses for the local player, driven by input feel.
+	A *held* guard can use an authored looping clip ("Guard"); the riposte flourish
+	stays procedural because it is a one-shot beat with its own pose data.
+]]
 local function holdGuardPose(pose: Pose)
 	local character = player.Character
 	if not character then
 		return
 	end
-	local rig = getSword(character)
-	if rig and rig.shoulder and rig.baseC0 then
+
+	local isRiposte = pose == POSES.ParryRiposte
+	local isRest = pose.x == 0 and pose.y == 0 and pose.z == 0
+
+	if not isRiposte and not isRest then
+		local track = Animations.play(character, "Guard", "Player", 0.12, 1, 1)
+		if track then
+			return
+		end
+	end
+	if isRest then
+		Animations.stop(character, "Guard", 0.15)
+	end
+
+	local rig = getArmRig(character)
+	if rig then
 		-- Guarding always wins over an in-flight swing tween.
 		cancelArmTween(character)
-		rig.shoulder.C0 = rig.baseC0 * poseCFrame(pose, 1)
+		local phase = if isRiposte then "Impact" elseif isRest then "Rest" else "Guard"
+		applyArmTargets(swingBeat(rig, pose, phase, false))
 	end
 end
 
@@ -999,6 +1325,10 @@ UserInputService.JumpRequest:Connect(function()
 end)
 
 local function bindCharacter(character: Model)
+	-- Fresh body, fresh combat camera framing.
+	applyCameraSetup()
+	applyCameraLock()
+
 	local humanoid = character:WaitForChild("Humanoid", 10)
 	if humanoid and humanoid:IsA("Humanoid") then
 		bindDoubleJump(humanoid)
@@ -1018,6 +1348,15 @@ if player.Character then
 	bindCharacter(player.Character)
 end
 player.CharacterAdded:Connect(bindCharacter)
+
+player.CharacterRemoving:Connect(function(character: Model)
+	-- Tracks, rigs and swing serials all belong to the body they were bound to.
+	Animations.forget(character)
+	swords[character] = nil
+	armRigs[character] = nil
+	armTweens[character] = nil
+	trailSerial[character] = nil
+end)
 
 -- ---------------------------------------------------------------------------
 -- Replicated FX
@@ -1143,13 +1482,11 @@ fxRemote.OnClientEvent:Connect(function(payload: unknown)
 		addFov(8)
 	elseif action == "Parry" then
 		if not isMine and character then
-			local rig = getSword(character)
-			if rig and rig.shoulder and rig.baseC0 then
-				rig.shoulder.C0 = rig.baseC0 * poseCFrame(POSES.ParryGuard, 1)
+			local rig = getArmRig(character)
+			if rig then
+				applyArmTargets(swingBeat(rig, POSES.ParryGuard, "Guard", false))
 				task.delay(0.35, function()
-					if rig.baseC0 then
-						rig.shoulder.C0 = rig.baseC0
-					end
+					applyArmTargets(swingBeat(rig, REST_POSE, "Rest", false))
 				end)
 			end
 		end
