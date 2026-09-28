@@ -411,20 +411,17 @@ end
 	resolve time, so repeated poses can never drift away from the idle stance.
 ]]
 type ArmRig = {
-	shoulder: Motor6D?,
-	shoulderBase: CFrame?,
-	-- R15 only; nil on R6, which then swings from the shoulder alone.
-	elbow: Motor6D?,
-	elbowBase: CFrame?,
-	waist: Motor6D?,
-	waistBase: CFrame?,
+    shoulder: Motor6D?,
+    elbow: Motor6D?,
+    waist: Motor6D?,
+    wrist: Motor6D?,    
 }
 
 local armRigs: { [Model]: ArmRig } = {}
 
 local function getArmRig(character: Model): ArmRig?
 	local cached = armRigs[character]
-	if cached and cached.shoulder and cached.shoulder.Parent and cached.shoulderBase then
+	if cached and cached.shoulder and cached.shoulder.Parent then
 		return cached
 	end
 
@@ -434,14 +431,13 @@ local function getArmRig(character: Model): ArmRig?
 	end
 	local elbow = findJoint(character, RIG.ElbowJointNames)
 	local waist = findJoint(character, RIG.WaistJointNames)
+	local wrist = findJoint(character, RIG.WristJointNames)
 
 	local rig: ArmRig = {
 		shoulder = shoulder,
-		shoulderBase = shoulder.C0,
 		elbow = elbow,
-		elbowBase = if elbow then elbow.C0 else nil,
 		waist = waist,
-		waistBase = if waist then waist.C0 else nil,
+		wrist = wrist,
 	}
 	armRigs[character] = rig
 	return rig
@@ -580,37 +576,40 @@ torso information; the fold and the turn are added here from CombatConfig.SwingR
 local function swingBeat(rig: ArmRig, pose: Pose, phase: string, alternate: boolean): { JointTarget }
 	local targets: { JointTarget } = {}
 
-	local shoulder = rig.shoulder
-	local shoulderBase = rig.shoulderBase
-	if shoulder and shoulderBase then
-		table.insert(targets, { joint = shoulder, goal = shoulderBase * poseCFrame(pose, 1) })
+	-- Shoulder
+	if rig.shoulder then
+		table.insert(targets, { joint = rig.shoulder, goal = poseCFrame(pose, 1) })
 	end
 
-	local elbow = rig.elbow
-	local elbowBase = rig.elbowBase
-	if elbow and elbowBase then
+	-- Elbow
+	if rig.elbow then
 		local fold = if phase == "Windup"
 			then SWING_RIG.ElbowFold
 			elseif phase == "Impact" then SWING_RIG.ElbowExtend
 			elseif phase == "Guard" then SWING_RIG.ElbowGuard
 			else 0
-		if alternate then
-			fold *= 0.75
-		end
-		table.insert(targets, { joint = elbow, goal = elbowBase * CFrame.Angles(math.rad(fold), 0, 0) })
+		if alternate then fold *= 0.75 end
+		table.insert(targets, { joint = rig.elbow, goal = CFrame.Angles(math.rad(fold), 0, 0) })
 	end
 
-	local waist = rig.waist
-	local waistBase = rig.waistBase
-	if waist and waistBase then
+	-- Wrist
+	if rig.wrist then
+		local flick = if phase == "Windup"
+			then SWING_RIG.WristFlick
+			elseif phase == "Impact" then SWING_RIG.WristSnap
+			else 0
+		if alternate then flick *= -1 end
+		table.insert(targets, { joint = rig.wrist, goal = CFrame.Angles(math.rad(flick), 0, 0) })
+	end
+
+	-- Waist
+	if rig.waist then
 		local turn = if phase == "Windup"
 			then SWING_RIG.WaistBack
 			elseif phase == "Impact" then SWING_RIG.WaistThrough
 			else 0
-		if alternate then
-			turn *= -1
-		end
-		table.insert(targets, { joint = waist, goal = waistBase * CFrame.Angles(0, math.rad(turn), 0) })
+		if alternate then turn *= -1 end
+		table.insert(targets, { joint = rig.waist, goal = CFrame.Angles(0, math.rad(turn), 0) })
 	end
 
 	return targets
@@ -619,7 +618,7 @@ end
 -- Snaps a beat into place. The impact frame must never be tweened through.
 local function applyArmTargets(targets: { JointTarget })
 	for _, target in targets do
-		target.joint.C0 = target.goal
+		target.joint.Transform = target.goal -- Changed from C0 to Transform!
 	end
 end
 
@@ -640,7 +639,7 @@ local function tweenArmTargets(
 		local tween = TweenService:Create(
 			target.joint,
 			TweenInfo.new(math.max(duration, 0.01), style, direction),
-			{ C0 = target.goal }
+			{ Transform = target.goal } -- Changed from C0 to Transform!
 		)
 		table.insert(tweens, tween)
 		tween:Play()
