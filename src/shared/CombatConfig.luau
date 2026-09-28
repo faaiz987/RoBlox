@@ -376,10 +376,9 @@ CombatConfig.Arena = {
 CombatConfig.RigParts = {
 	HandNames = { "RightHand", "Right Arm" },
 	ShoulderJointNames = { "RightShoulder", "Right Shoulder" },
-	-- R15 only: R6 rigs have no elbow or waist joint, so those limbs simply stay
-	-- rigid and the shoulder carries the whole swing.
 	ElbowJointNames = { "RightElbow", "Right Elbow" },
 	WaistJointNames = { "Waist", "RootJoint" },
+	WristJointNames = { "RightWrist", "Right Wrist" }, -- 👈 ADD THIS LINE
 	KatanaName = "Katana",
 	KatanaGripName = "KatanaGrip",
 }
@@ -392,15 +391,13 @@ CombatConfig.RigParts = {
 	through the swing. Flip a sign here if a rig reads backwards.
 ]]
 CombatConfig.SwingRig = {
-	-- Fold of the forearm during the windup, in degrees.
 	ElbowFold = 58,
-	-- Forearm at the impact: just short of straight.
 	ElbowExtend = -6,
-	-- Guard hold: blade brought across the body.
 	ElbowGuard = 74,
-	-- Torso turn away from the target on the windup, then through it on the cut.
 	WaistBack = -14,
 	WaistThrough = 18,
+	WristFlick = -45, -- 👈 ADD THIS LINE (Flicks hand back on windup)
+	WristSnap = 35,   -- 👈 ADD THIS LINE (Snaps hand forward on impact)
 }
 
 -- ---------------------------------------------------------------------------
@@ -439,6 +436,11 @@ CombatConfig.Poses = {
 --   Every id is optional. An empty string means "no clip authored yet", and the
 --   caller falls back to the procedural Motor6D posing instead of trying to load
 --   a dead asset -- so the game animates correctly the moment it is synced.
+--
+--   To fill a slot: add the `Animation` instance to the rig (named after one of the
+--   aliases below) or paste a published `rbxassetid://`. `RigAnimationPack`
+--   authors and previews rig clips; `RigAnimationPack.STOCK` lists Roblox's own
+--   walk / run / sword ids for rigs that can use them.
 -- ---------------------------------------------------------------------------
 
 CombatConfig.Animations = {
@@ -450,6 +452,11 @@ CombatConfig.Animations = {
 		Heavy = "",
 		Guard = "",
 		Parry = "",
+		-- Locomotion. The default `Animate` script owns walk/run, so nothing plays
+		-- these yet; they are here so a clip authored for a rig can be wired in one
+		-- line once it has a permanent id.
+		Walk = "",
+		Run = "",
 	} :: { [string]: string },
 
 	-- Optional R6 variants, used when the local avatar is R6.
@@ -457,6 +464,10 @@ CombatConfig.Animations = {
 		Slash1 = "",
 		Slash2 = "",
 		Heavy = "",
+		Guard = "",
+		Parry = "",
+		Walk = "",
+		Run = "",
 	} :: { [string]: string },
 
 	-- Enemy clips. The wave rigs are R6 and script-driven, so these are additive:

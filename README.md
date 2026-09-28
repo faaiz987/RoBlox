@@ -49,6 +49,8 @@ Three attacks inside the `1.2s` combo window finish with the heavy finisher *Hea
 src/
   shared/                        -> ReplicatedStorage.Shared
     CombatConfig.luau            timings, combo steps, enemy archetypes, poses, attributes
+    RigAnimationPack.luau        bakes rig clips into KeyframeSequences + reports their ids
+    Animations.luau              optional-clip plumbing: id -> Animation instance -> fallback
     PerkDatabase.luau            perk registry, rolling, stat folding
     Remotes.luau                 remote/signal registry + payload types
   server/                        -> ServerScriptService.Server
@@ -61,6 +63,42 @@ src/
     PerkUI.client.luau           perk cards, wave banner, HUD, health bar
     CombatHUD.client.luau        control hints + live parry/dodge cooldown badges
 ```
+
+## Animating a rig
+
+Animation **asset ids only exist once a KeyframeSequence has been uploaded to Roblox**. The
+Animation Editor (or Open Cloud, with an API key) does the uploading; nothing in this repo can do
+it for you. What the repo *can* do is author the sequence and hand you the number, so
+`RigAnimationPack` does everything up to the publish click.
+
+Select your rig in Studio and run this in the command bar:
+
+```lua
+local pack = require(game.ReplicatedStorage.Shared.RigAnimationPack)
+pack.install(workspace.Rig)   -- author + attach + print ids
+pack.preview(workspace.Rig)   -- walk, run, slash, guard (play mode)
+```
+
+`install` bakes Walk, Run, Slash1, Slash2, Heavy, Guard and Parry out of the game's *own* tuned
+numbers -- the same `CombatConfig.Poses` and `SwingRig` values `CombatController` writes to each
+joint -- so a rig wearing the clips moves the way the game already moves. It then:
+
+1. registers each clip with `KeyframeSequenceProvider`, which makes it playable immediately,
+2. attaches an `Animation` instance to the rig under its `CombatConfig.Animations.Aliases` name,
+   so `Animations.track` picks it up with no config change, and
+3. stores a copy under `ReplicatedStorage.AnimSaves.<rig>`.
+
+Those registered ids are **session-scoped**. For a permanent `rbxassetid://`, publish the clip:
+the authored sequences are kept under `ReplicatedStorage.AnimSaves.<rig>` so the Animation Editor
+can open them for that rig, and publishing returns the id to paste into
+`CombatConfig.Animations` -- the shared module then resolves that clip by id instead of by the
+instance the pack attached.
+
+A publish is not always necessary. For **R15** rigs `RigAnimationPack.STOCK` carries Roblox's own
+clips, which never expire: `507777826` walk, `507767714` run, `522635514` sword slash, `522638767`
+sword lunge. Pass `{ source = "stock" }` to attach those instead. R6 rigs get the stock walk/run
+(`180426354`) only -- the R15 sword clips cannot drive R6 joints, which is exactly why the pack
+bakes its own.
 
 > **Rojo file naming:** a plain `*.luau` file syncs as a *ModuleScript*, so files that must run carry the `*.server.luau` (Script) or `*.client.luau` (LocalScript) suffix. Modules such as `CombatConfig.luau` and `KatanaFactory.luau` intentionally stay plain.
 
