@@ -15,7 +15,7 @@
 	`rbxassetid://`, and that number is what belongs in `CombatConfig.Animations`.
 
 	The poses are not invented here. The three sword clips are the exact numbers
-	`CombatController` writes to `Motor6D.Transform` (`CombatConfig.Poses` plus
+	`CombatController` writes to the shoulder's rest C0 (`CombatConfig.Procedural` plus
 	`CombatConfig.SwingRig`) interpolated over the same windup/impact/recovery beats,
 	and the walk and run cycles reuse the amplitudes the enemy stride runs at. These
 	clips are the *baked* form of the procedural animation, so a rig wearing them
@@ -56,6 +56,11 @@ local OWNER = "CB_PackKey"
 local SNAP = 0.034
 
 local IDENTITY = CFrame.new()
+
+-- Procedural animation data, mirrored from the client: the clip poses below are
+-- built from the same tables `CombatController` tweens onto each joint's rest C0.
+local PROCEDURAL = CombatConfig.Procedural
+local FLIP = PROCEDURAL.Flip
 
 --[[
 	Roblox's own clips, copied from the stock `Animate` script's `animNames` table
@@ -137,8 +142,10 @@ export type Report = {
 	missing: { string },
 }
 
+-- Degrees to a joint rotation, with the same mirror fix the client applies, so a
+-- flipped rig bakes flipped clips instead of disagreeing with the code.
 local function degrees(x: number, y: number, z: number): CFrame
-	return CFrame.Angles(math.rad(x), math.rad(y), math.rad(z))
+	return CFrame.Angles(math.rad(x * FLIP.x), math.rad(y * FLIP.y), math.rad(z * FLIP.z))
 end
 
 -- CombatConfig stores poses as { x, y, z } degrees; this is the same conversion the
@@ -256,18 +263,21 @@ end
 	id is configured.
 ]]
 local function swingBeat(stepIndex: number, phase: string): JointPose
-	local pose = CombatConfig.getComboStep(stepIndex)
-	local alternate = pose.kind ~= "Heavy" and stepIndex % 2 == 0
+	local step = CombatConfig.getComboStep(stepIndex)
+	local alternate = step.kind ~= "Heavy" and stepIndex % 2 == 0
 	local rig = CombatConfig.SwingRig
-	local poses = CombatConfig.Poses
+	local beat = PROCEDURAL.Combo[stepIndex] or PROCEDURAL.Combo[1]
 
+	--[[
+		The shoulder holds the beat's cut pose in both halves of a light slash -- the
+		impact beat only re-aims the forearm, wrist and torso -- while the finisher
+		raises overhead first and then slams into the same pose.
+	]]
 	local shoulder: { x: number, y: number, z: number }
-	if pose.kind == "Heavy" then
-		shoulder = if phase == "Windup" then poses.HeavyWindup else poses.HeavyImpact
-	elseif phase == "Windup" then
-		shoulder = if alternate then poses.SlashAlternate else poses.SlashWindup
+	if step.kind == "Heavy" and phase == "Windup" then
+		shoulder = beat.raise or beat.pose
 	else
-		shoulder = poses.SlashImpact
+		shoulder = beat.pose
 	end
 
 	local fold = if phase == "Windup" then rig.ElbowFold else rig.ElbowExtend
@@ -347,7 +357,8 @@ end
 --[[
 	A held guard: blade up in front of the face, with a shallow breath so the loop
 	does not read as a frozen pose. The sword arm is the client's guard beat verbatim
-	(`ParryGuard` + `ElbowGuard`); the off arm and the wide stance are additive, since
+	(the parry stance from `Procedural.Parry` + `ElbowGuard`); the off arm and the wide
+	stance are additive, since only the local player's sword arm is ever posed by code.
 	`holdGuardPose` only ever drives the sword arm.
 ]]
 local function guardPose(phase: number): JointPose
@@ -355,7 +366,7 @@ local function guardPose(phase: number): JointPose
 	return {
 		Torso = degrees(0, sway, 0),
 		Head = degrees(0, -sway, 0),
-		RightArm = poseCFrame(CombatConfig.Poses.ParryGuard),
+		RightArm = poseCFrame(PROCEDURAL.Parry.pose),
 		RightForearm = degrees(CombatConfig.SwingRig.ElbowGuard, 0, 0),
 		LeftArm = degrees(26, 16, -12 + sway),
 		LeftForearm = degrees(48, 0, 0),
@@ -412,28 +423,27 @@ local function slashClip(key: string, stepIndex: number): Clip
 	}
 end
 
--- The riposte the guard pose does not cover: a short draw away, then the counter.
+--[[
+	The parry: the blade snaps up into the stance, is held for the window, then eases
+	home over `back`. This is one continuous beat rather than a flourish, because that
+	is exactly what the client does -- the stance is held through the parry window (and
+	0.1s longer on a clash) and never lets go early.
+]]
 local function parryClip(): Clip
 	local guard = guardPose(0)
-	local riposte: JointPose = {
-		Torso = degrees(0, CombatConfig.SwingRig.WaistThrough * 0.6, 0),
-		Head = degrees(0, -8, 0),
-		RightArm = poseCFrame(CombatConfig.Poses.ParryRiposte),
-		RightForearm = degrees(CombatConfig.SwingRig.ElbowExtend, 0, 0),
-		RightHand = degrees(CombatConfig.SwingRig.WristSnap, 0, 0),
-		LeftArm = degrees(14, -10, -8),
-		LeftForearm = degrees(30, 0, 0),
-	}
+	local inTime = PROCEDURAL.Parry.out
+	local hold = PROCEDURAL.Parry.hold
+	local back = PROCEDURAL.Parry.back
 	return {
 		key = "Parry",
-		length = 0.34,
+		length = inTime + hold + back,
 		loop = false,
 		priority = Enum.AnimationPriority.Action,
 		frames = {
-			{ t = 0, pose = scaled(guard, 0.6) },
-			{ t = 0.08, pose = scaled(guard, 0.85) },
-			{ t = 0.2, pose = riposte },
-			{ t = 0.34, pose = restOf(mix(guard, riposte, 1)) },
+			{ t = 0, pose = restOf(guard) },
+			{ t = inTime, pose = guard },
+			{ t = inTime + hold, pose = guard },
+			{ t = inTime + hold + back, pose = restOf(guard) },
 		},
 	}
 end
@@ -479,9 +489,8 @@ end
 
 --[[
 	Turns a clip into the asset the Animation Editor publishes. A `Pose` is named
-	after the joint's *part* (`Motor6D.Part1`), and its `CFrame` is the joint's
-	`Transform` -- the same channel `CombatController` writes when it swings
-	procedurally, which is what makes the clip and the code agree.
+	after the joint's *part* (`Motor6D.Part1`), and its `CFrame` is the rotation that	part carries relative to rest -- the same angles `CombatController` multiplies
+	onto the joint's C0, which is what makes a clip and the procedural swing agree.
 	Returns nil when the rig has no joint the clip could drive.
 ]]
 local function buildSequence(clip: Clip, slots: { [string]: Motor6D }): KeyframeSequence?

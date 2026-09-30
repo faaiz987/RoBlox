@@ -100,6 +100,22 @@ local function newAttachment(name: string, point: Vector3, parent: Instance): At
 end
 
 --[[
+	Resolves a blade endpoint by any of its known names, minting the current one when
+	the blade predates it. An older revision named these "Hilt"/"Tip"; adopting those
+	instead of creating siblings is what keeps both blade ribbons on one pair of
+	points -- two attachments at the same spot would tear the ribbon in half.
+]]
+local function ensureAttachment(blade: BasePart, names: { string }, point: Vector3): Attachment
+	for _, name in names do
+		local found = blade:FindFirstChild(name)
+		if found and found:IsA("Attachment") then
+			return found
+		end
+	end
+	return newAttachment(names[1], point, blade)
+end
+
+--[[
 	Resolves the shoulder joint lazily, caching it on the katana the first time it
 	is found. A rig whose arms replicate a frame late therefore still animates
 	instead of being stuck with a nil joint forever.
@@ -308,8 +324,8 @@ function KatanaFactory.attach(character: Model): Katana?
 	newMotor("GuardJoint", handle, guard, GUARD_OFFSET)
 	newMotor("BladeJoint", handle, blade, BLADE_OFFSET)
 
-	local hiltAttachment = newAttachment("Hilt", BLADE_HILT_LOCAL, blade)
-	local tipAttachment = newAttachment("Tip", BLADE_TIP_LOCAL, blade)
+	local hiltAttachment = ensureAttachment(blade, RIG.HiltAttachmentNames, BLADE_HILT_LOCAL)
+	local tipAttachment = ensureAttachment(blade, RIG.TipAttachmentNames, BLADE_TIP_LOCAL)
 
 	local trail = Instance.new("Trail")
 	trail.Name = "SlashTrail"

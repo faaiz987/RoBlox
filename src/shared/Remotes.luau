@@ -112,6 +112,9 @@ Remotes.Names = {
 	Parry = "Parry",
 	Dodge = "Dodge",
 	SelectPerk = "SelectPerk",
+	-- Main menu -> WaveManager: "I pressed PLAY". The run holds in Intermission
+	-- until every player has sent it (or the lobby times out).
+	StartWave = "StartWave",
 
 	-- server -> client
 	CombatFx = "CombatFx",
@@ -133,6 +136,7 @@ local REMOTE_NAMES: { string } = {
 	Remotes.Names.Parry,
 	Remotes.Names.Dodge,
 	Remotes.Names.SelectPerk,
+	Remotes.Names.StartWave,
 	Remotes.Names.CombatFx,
 	Remotes.Names.PerkChoice,
 	Remotes.Names.PerkGranted,
