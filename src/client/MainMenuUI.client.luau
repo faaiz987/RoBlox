@@ -32,6 +32,7 @@ local Debris = game:GetService("Debris")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local CombatConfig = require(Shared:WaitForChild("CombatConfig"))
+local KeybindManager = require(Shared:WaitForChild("KeybindManager"))
 local Remotes = require(Shared:WaitForChild("Remotes"))
 
 -- Sibling module: `assert` because `script.Parent` is typed optional, and this
@@ -66,19 +67,10 @@ type CreditsModal = {
 -- Theme
 -- ---------------------------------------------------------------------------
 
-local THEME = {
-	Backdrop = Color3.fromRGB(6, 7, 11),
-	Panel = Color3.fromRGB(20, 22, 30),
-	PanelLight = Color3.fromRGB(34, 37, 48),
-	Ink = Color3.fromRGB(236, 240, 247),
-	Muted = Color3.fromRGB(150, 158, 174),
-	Accent = Color3.fromRGB(255, 214, 108),
-	Danger = Color3.fromRGB(255, 128, 118),
-	Stroke = Color3.fromRGB(74, 80, 96),
-	Slash = Color3.fromRGB(228, 236, 245),
-	Parry = Color3.fromRGB(255, 214, 108),
-	Dodge = Color3.fromRGB(160, 214, 255),
-}
+-- One palette for the title screen and the options panel it opens, shared with
+-- the overlay that reopens that same panel mid-run (UiTheme). Structural shape
+-- is OptionsMenu.Theme, so no cast is needed at the create() call below.
+local THEME = require(clientFolder:WaitForChild("UiTheme"))
 
 local GUI_NAMES = { CombatHUD = true, PerkUI = true }
 
@@ -368,25 +360,36 @@ local function newCreditsModal(): CreditsModal
 	panel.AnchorPoint = Vector2.new(0.5, 0.5)
 	panel.Position = UDim2.fromScale(0.5, 0.5)
 	panel.Size = UDim2.fromOffset(520, 348)
-	panel.BackgroundColor3 = THEME.Panel
-	panel.BackgroundTransparency = 0.04
+	-- Fade mask only. The painted surface is the white frame below, because a
+	-- gradient parented to a CanvasGroup tints everything the group renders --
+	-- which is how this panel used to end up a near-black slab.
+	panel.BackgroundTransparency = 1
 	panel.BorderSizePixel = 0
 	panel.GroupTransparency = 1
 	panel.Parent = root
 	corner(panel, 16)
-	stroke(panel, THEME.Stroke, 1, 0.4)
+
+	local surface = Instance.new("Frame")
+	surface.Name = "Surface"
+	surface.Size = UDim2.fromScale(1, 1)
+	surface.BackgroundColor3 = Color3.new(1, 1, 1)
+	surface.BorderSizePixel = 0
+	surface.Parent = panel
+	corner(surface, 16)
+	stroke(surface, THEME.RowStroke, 1, 0.45)
 
 	local sheen = Instance.new("UIGradient")
 	sheen.Rotation = 90
 	sheen.Color = ColorSequence.new({
-		ColorSequenceKeypoint.new(0, THEME.PanelLight),
-		ColorSequenceKeypoint.new(1, THEME.Panel),
+		ColorSequenceKeypoint.new(0, THEME.Surface),
+		ColorSequenceKeypoint.new(1, Color3.new(
+			THEME.Surface.R * 0.82,
+			THEME.Surface.G * 0.82,
+			THEME.Surface.B * 0.82
+		)),
 	})
-	sheen.Transparency = NumberSequence.new({
-		NumberSequenceKeypoint.new(0, 0.3),
-		NumberSequenceKeypoint.new(1, 0.8),
-	})
-	sheen.Parent = panel
+	sheen.Transparency = NumberSequence.new(0)
+	sheen.Parent = surface
 
 	local pop = Instance.new("UIScale")
 	pop.Scale = 1
@@ -520,7 +523,17 @@ footerLeft.Text = "RISK OF BLOX · EARLY BUILD"
 
 local footerRight = newText(content, "FooterRight", UDim2.new(1, -LEFT - 440, 1, -32), UDim2.fromOffset(440, 16), Enum.Font.GothamMedium, 11, THEME.Muted)
 footerRight.TextXAlignment = Enum.TextXAlignment.Right
-footerRight.Text = "SESSION KEYBINDS · REBIND IN OPTIONS"
+--[[
+	Names the in-game door as well as this screen's own button: a player who never
+	saw the title screen (a late join) can still be told the panel exists mid-run.
+	The key is read live, so a player who already moved it is not told a lie.
+]]
+local function syncFooterHint()
+	footerRight.Text = `REBIND IN OPTIONS  ·  OR IN-GAME WITH [{KeybindManager:Label("Options")}]`
+end
+
+syncFooterHint()
+KeybindManager.OnBindChanged.Event:Connect(syncFooterHint)
 
 -- ---------------------------------------------------------------------------
 -- Post effects: blur + grade the world behind the menu

@@ -69,9 +69,11 @@ export type Perk = {
 
 PerkDatabase.Perks = {
 	{
+		-- The id is the wire format for the perk list and stays put; the card is now
+		-- the *second* air jump, since the first one is part of every player's kit.
 		id = "DoubleJump",
-		title = "Double Jump",
-		description = "Kick off the air itself: gain one extra mid-air jump.",
+		title = "Air Step",
+		description = "A third jump: one more kick off the empty air than everyone gets.",
 		flavor = '"The wind is a step, if you believe it is."',
 		glyph = "⇈",
 		imageId = "",

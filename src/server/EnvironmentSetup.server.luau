@@ -7,8 +7,9 @@
 	  * A circular floor of dark cobblestone tiles laid out to
 	    `CombatConfig.Arena.Radius`, with every tile top sitting on y = 0 -- so
 	    `Arena.RigRootY` still drops enemy feet exactly onto the floor.
-	  * A neon perimeter: an amber ring wall (collidable, so nobody walks off the
-	    edge), a crimson inner line, and eight lamp posts with point lights.
+	  * A medieval palisade boundary: plank panels (collidable, so nobody walks off
+	    the edge) capped with a beam and a jagged row of sharpened wooden stakes, a
+	    crimson inner line, and eight wooden lamp posts carrying amber lanterns.
 	  * Dusk lighting: 19:00 sun, dense horizon Atmosphere haze, Bloom to make the
 	    blade ribbons glow, and a high-contrast ColorCorrection for the samurai look.
 
@@ -54,19 +55,43 @@ local SETTINGS = {
 	TileColorAlt = Color3.fromRGB(90, 92, 104),
 	TileColorWorn = Color3.fromRGB(104, 96, 104),
 
-	RingColor = Color3.fromRGB(255, 138, 60),
 	InnerLineColor = Color3.fromRGB(255, 58, 62),
 	RingThickness = 1.4,
 	InnerLineHeight = 0.45,
 	RingSegmentsPerStud = 0.22,
 
+	--[[
+		The boundary is a wooden palisade, not a neon ring. An emissive orange wall
+		blooms (BloomThreshold sits at 1.4) and glares at the camera every match, and
+		the wall a player duels in front of should look like something enemies would
+		have built. These wood tones sit around a third of the old ring's brightness,
+		which leaves the lanterns and the blade ribbons as the arena's only light.
+	]]
+	WallThickness = 2.4,
+	WallColor = Color3.fromRGB(76, 55, 39),
+	WallColorAlt = Color3.fromRGB(63, 45, 32),
+	WallBeamColor = Color3.fromRGB(49, 35, 25),
+
+	-- Sharpened stakes along the top. Spacing is centre to centre, so the row reads
+	-- as separate logs, and every stake is jittered in height and tone.
+	StakeSpacing = 2.6,
+	StakeWidth = 1.7,
+	StakeHeight = 3.6,
+	StakeColor = Color3.fromRGB(98, 70, 46),
+	StakeColorAlt = Color3.fromRGB(82, 58, 38),
+
 	PillarCount = 8,
-	PillarHeight = 16,
+	-- Taller than the stake crest (14 wall + ~4 stake, both sunk into the floor), or
+	-- the lanterns would be hidden behind the palisade from inside the arena.
+	PillarHeight = 21,
 	PillarWidth = 1.7,
-	PillarColor = Color3.fromRGB(255, 178, 96),
+	-- A wooden post carrying an amber lantern, instead of a glowing bar: the light
+	-- stays, the glare does not.
+	PillarWoodColor = Color3.fromRGB(66, 47, 33),
+	LanternColor = Color3.fromRGB(255, 168, 92),
 	-- Lamps have to actually reach the duelling ground, not just the wall.
-	PillarLightRange = 78,
-	PillarLightBrightness = 3,
+	PillarLightRange = 72,
+	PillarLightBrightness = 2.4,
 	-- A soft warm pool over the spawn dais so the centre of the arena is never a
 	-- dark void between lamp posts.
 	DaisLightRange = 64,
@@ -228,11 +253,139 @@ local function buildRing(name: string, radius: number, height: number, thickness
 	return ring
 end
 
+--[[
+	Sharpened tops for the palisade.
+	`Enum.MeshType.Pyramid` is a four-sided pyramid with its apex up -- a
+	sharpened log exactly -- but it is an old mesh type, so the arena probes for it
+	once. If it ever goes, stakes keep their shafts and simply cap blunt, instead of
+	taking the whole build down with a failed enum lookup.
+]]
+local STAKE_MESH: Enum.MeshType? = nil
+do
+	local ok, meshType = pcall(function()
+		return (Enum.MeshType :: any).Pyramid
+	end)
+	if ok then
+		STAKE_MESH = meshType
+	end
+end
+
+local function buildStakePoint(name: string, width: number, height: number, color: Color3): Part
+	local point = newPart(name, Vector3.new(width, height, width), color, Enum.Material.Wood)
+	point.CanCollide = false
+	point.CastShadow = false
+	local meshType = STAKE_MESH
+	if meshType then
+		local mesh = Instance.new("SpecialMesh")
+		mesh.Name = "Spike"
+		mesh.MeshType = meshType
+		-- For a built-in mesh the Scale *is* the size in studs; the part's own Size
+		-- only carries the selection box.
+		mesh.Scale = Vector3.new(width, height, width)
+		mesh.Parent = point
+	else
+		point.Size = Vector3.new(width * 0.7, height, width * 0.7)
+	end
+	return point
+end
+
+--[[
+	The palisade: plank panels around the ring, a beam capping each panel, and a
+	jagged row of sharpened stakes on top. Deterministic, like the floor -- two
+	servers build the same wall. The panels are what keep the player in; the stakes
+	are sculpture, which is why they carry no collision.
+]]
+local function buildSpikedWall(name: string, radius: number): Model
+	local wall = Instance.new("Model")
+	wall.Name = name
+
+	local height = ARENA.WallHeight
+	local thickness = SETTINGS.WallThickness
+	local beamHeight = 1.1
+	local circumference = 2 * math.pi * radius
+	local segments = math.max(24, math.floor(circumference * SETTINGS.RingSegmentsPerStud))
+	local segmentLength = circumference / segments
+	-- A hair short of its slot: two panels sharing a face would z-fight down the
+	-- whole ring, which is the floor comment's warning one storey up.
+	local panelLength = segmentLength * 0.97
+
+	for index = 1, segments do
+		local angle = (index / segments) * math.pi * 2
+		local position = Vector3.new(math.cos(angle) * radius, height * 0.5 - SETTINGS.Sink, math.sin(angle) * radius)
+		-- Facing the centre, so the wall presents its flat face outward and the
+		-- base is sunk into the floor instead of sharing the tile plane.
+		local facing = CFrame.lookAt(position, Vector3.new(0, position.Y, 0))
+
+		local plank = newPart(
+			`{name}_Plank_{index}`,
+			Vector3.new(panelLength, height, thickness),
+			if index % 2 == 0 then SETTINGS.WallColor else SETTINGS.WallColorAlt,
+			Enum.Material.WoodPlanks
+		)
+		-- No shadow casting anywhere on the perimeter: a fourteen-stud wall throws a
+		-- long golden-hour shadow across the duelling floor, and the original ring
+		-- was shadowless for the same reason.
+		plank.CastShadow = false
+		plank.CFrame = facing
+		plank.Parent = wall
+
+		-- The beam sits *into* the panels rather than on top of them: a shared plane
+		-- at the wall's cap would shimmer as the camera moves.
+		local beam = newPart(
+			`{name}_Beam_{index}`,
+			Vector3.new(segmentLength, beamHeight, thickness * 1.35),
+			SETTINGS.WallBeamColor,
+			Enum.Material.WoodPlanks
+		)
+		beam.CastShadow = false
+		beam.CFrame = facing * CFrame.new(0, height * 0.5 - SETTINGS.Sink + beamHeight * 0.5 - 0.15, 0)
+		beam.Parent = wall
+	end
+
+	-- Stakes: one per slot, sunk into the beam and jittered, so the crest reads as
+	-- sharpened logs rather than as a fence.
+	local stakes = math.max(8, math.floor(circumference / SETTINGS.StakeSpacing))
+	local stakeBaseY = height - SETTINGS.Sink + beamHeight - 0.3
+
+	for index = 1, stakes do
+		local angle = (index / stakes) * math.pi * 2
+		local x = math.cos(angle) * radius
+		local z = math.sin(angle) * radius
+		local facing = CFrame.lookAt(Vector3.new(x, stakeBaseY, z), Vector3.new(0, stakeBaseY, 0))
+
+		local jitter = 0.86 + (((index * 7) % 5) / 4) * 0.28
+		local total = SETTINGS.StakeHeight * jitter
+		local shaftHeight = total * 0.6
+		local pointHeight = total - shaftHeight
+		local width = SETTINGS.StakeWidth * (0.94 + (((index * 3) % 4) / 3) * 0.12)
+		local color = if index % 3 == 0 then SETTINGS.StakeColorAlt else SETTINGS.StakeColor
+
+		local shaft = newPart(
+			`{name}_Stake_{index}`,
+			Vector3.new(width, shaftHeight, width),
+			color,
+			Enum.Material.WoodPlanks
+		)
+		shaft.CanCollide = false
+		shaft.CastShadow = false
+		shaft.CFrame = facing * CFrame.new(0, shaftHeight * 0.5, 0)
+		shaft.Parent = wall
+
+		local point = buildStakePoint(`{name}_Spike_{index}`, width * 1.08, pointHeight, color)
+		-- Nudged down into the shaft by a tenth of a stud, for the same reason the
+		-- beam is nudged into the panels.
+		point.CFrame = facing * CFrame.new(0, shaftHeight + pointHeight * 0.5 - 0.1, 0)
+		point.Parent = wall
+	end
+
+	return wall
+end
+
 local function buildPerimeter(parent: Instance)
 	local rings = Instance.new("Model")
 	rings.Name = "Perimeter"
 
-	local wall = buildRing("Boundary", ARENA.BoundaryRadius, ARENA.WallHeight, SETTINGS.RingThickness, SETTINGS.RingColor)
+	local wall = buildSpikedWall("Boundary", ARENA.BoundaryRadius)
 	wall.Parent = rings
 
 	local line = buildRing(
@@ -244,31 +397,57 @@ local function buildPerimeter(parent: Instance)
 	)
 	line.Parent = rings
 
-	-- Lamp posts just outside the wall: the only warm light in the arena.
+	--[[
+		Lamp posts just outside the wall, and the only warm light in the arena: a
+		wooden post carrying a small amber lantern under a little hood. The glow comes
+		from a lamp now, not from a sixteen-stud bar of neon.
+	]]
 	local pillarRadius = ARENA.BoundaryRadius + 2.6
+	local postTop = SETTINGS.PillarHeight - SETTINGS.Sink
 	for index = 1, SETTINGS.PillarCount do
 		local angle = (index / SETTINGS.PillarCount) * math.pi * 2
-		local pillar = newPart(
+		local x = math.cos(angle) * pillarRadius
+		local z = math.sin(angle) * pillarRadius
+
+		local post = newPart(
 			`Pillar_{index}`,
 			Vector3.new(SETTINGS.PillarWidth, SETTINGS.PillarHeight, SETTINGS.PillarWidth),
-			SETTINGS.PillarColor,
+			SETTINGS.PillarWoodColor,
+			Enum.Material.WoodPlanks
+		)
+		post.CastShadow = false
+		post.Position = Vector3.new(x, SETTINGS.PillarHeight * 0.5 - SETTINGS.Sink, z)
+		post.Parent = rings
+
+		-- Lantern and hood are each sat a tenth of a stud into the piece below, so no
+		-- two faces in the stack ever share a plane.
+		local lantern = newPart(
+			`Lantern_{index}`,
+			Vector3.new(1.1, 1.1, 1.1),
+			SETTINGS.LanternColor,
 			Enum.Material.Neon
 		)
-		pillar.CastShadow = false
-		pillar.Position = Vector3.new(
-			math.cos(angle) * pillarRadius,
-			SETTINGS.PillarHeight * 0.5 - SETTINGS.Sink,
-			math.sin(angle) * pillarRadius
+		lantern.CastShadow = false
+		lantern.Position = Vector3.new(x, postTop + 0.45, z)
+		lantern.Parent = rings
+
+		local hood = newPart(
+			`LanternHood_{index}`,
+			Vector3.new(1.7, 0.3, 1.7),
+			SETTINGS.WallBeamColor,
+			Enum.Material.WoodPlanks
 		)
-		pillar.Parent = rings
+		hood.CastShadow = false
+		hood.Position = Vector3.new(x, postTop + 1.05, z)
+		hood.Parent = rings
 
 		local light = Instance.new("PointLight")
 		light.Name = "LampGlow"
-		light.Color = SETTINGS.PillarColor
+		light.Color = SETTINGS.LanternColor
 		light.Brightness = SETTINGS.PillarLightBrightness
 		light.Range = SETTINGS.PillarLightRange
 		light.Shadows = false
-		light.Parent = pillar
+		light.Parent = lantern
 	end
 
 	rings.Parent = parent
@@ -294,14 +473,14 @@ end
 
 	-- A lamp on the dais, so the middle of the arena is lit from within the fight
 	-- rather than only from the perimeter.
-	local lamp = newPart("DaisLamp", Vector3.new(0.7, 0.5, 0.7), SETTINGS.PillarColor, Enum.Material.Neon)
+	local lamp = newPart("DaisLamp", Vector3.new(0.7, 0.5, 0.7), SETTINGS.LanternColor, Enum.Material.Neon)
 	lamp.CastShadow = false
 	lamp.Position = Vector3.new(0, 0.75, 8.8)
 	lamp.Parent = dais
 
 	local daisLight = Instance.new("PointLight")
 	daisLight.Name = "DaisGlow"
-	daisLight.Color = SETTINGS.PillarColor
+	daisLight.Color = SETTINGS.LanternColor
 	daisLight.Brightness = SETTINGS.DaisLightBrightness
 	daisLight.Range = SETTINGS.DaisLightRange
 	daisLight.Shadows = false

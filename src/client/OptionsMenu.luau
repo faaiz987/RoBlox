@@ -13,13 +13,20 @@
 
 	It owns nothing but its own widgets: the bind store, the duplicate rules and the
 	display names all live in KeybindManager, so adding a fourth action is one line
-	there and one row here.
+	there and one row here -- and `layoutFor` grows the panel to match, so a fifth
+	action cannot push a row through the status line.
 
-		modal = OptionsMenu.create(parentGui, THEME, playSound)
-		modal.open() / modal.close() / modal.isOpen()
+		modal = OptionsMenu.create(parentGui, THEME, playSound, onVisibilityChanged?)
+		modal.open() / modal.close() / modal.isOpen() / modal.isCapturing()
 
-	Rebinding: click a bind chip -> the next key or mouse button becomes the bind.
-	Escape cancels. A duplicate is refused with a reason instead of silently
+	Two hosts build one of these: MainMenuUI behind [ OPTIONS ] on the title
+	screen, and OptionsOverlay mid-run. The optional fourth argument fires the
+	instant the modal opens or closes (not when its fade finishes), which is how a
+	host claims and gives back the cursor.
+
+	Rebinding: click a bind chip -- or anywhere on its row, which is the same hit
+	target wearing a quieter hat -- and the next key or mouse button becomes the
+	bind. Escape cancels. A duplicate is refused with a reason instead of silently
 	stealing the other action's key.
 ]]
 
@@ -48,6 +55,14 @@ export type Theme = {
 	Slash: Color3,
 	Parry: Color3,
 	Dodge: Color3,
+	-- The modal's surface ramp, lightest at the top of the stack (see UiTheme).
+	-- Optional on purpose: a host whose theme module is an older revision still
+	-- renders a legible panel, falling back to the panel colours it does have --
+	-- the same defensive shape as ACTIONS above.
+	Surface: Color3?,
+	Row: Color3?,
+	Chip: Color3?,
+	RowStroke: Color3?,
 }
 
 export type Modal = {
@@ -55,10 +70,17 @@ export type Modal = {
 	open: () -> (),
 	close: () -> (),
 	isOpen: () -> boolean,
+	-- True while a row is waiting for the player's next key. A host that binds the
+	-- same key it uses to open the panel must stand down while this is true, or
+	-- that key could never be bound to an action.
+	isCapturing: () -> boolean,
 }
 
 type Row = {
+	card: Frame,
 	chip: TextButton,
+	glyph: TextLabel,
+	caption: TextLabel,
 	outline: UIStroke,
 	dot: Frame,
 	accent: Color3,
@@ -67,8 +89,41 @@ type Row = {
 local OptionsMenu = {}
 
 local PANEL_W = 620
-local PANEL_H = 452
 local PAD = 24
+
+-- Rows, and everything below them ------------------------------------------
+local ROW_H = 56
+local ROW_GAP = 8
+local ROWS_TOP = 122
+
+--[[
+	The panel is exactly as tall as its content: the row stack's own height plus a
+	fixed ladder of gaps down to the footer hint. Every vertical below the header
+	comes from here, so the layout follows the action list instead of a hand-typed
+	height that a fourth action would overlap.
+]]
+local function layoutFor(count: number): {
+	panelH: number,
+	rowsH: number,
+	statusY: number,
+	dividerY: number,
+	buttonsY: number,
+	hintY: number,
+}
+	local rowsH = count * ROW_H + math.max(count - 1, 0) * ROW_GAP
+	local statusY = ROWS_TOP + rowsH + 6
+	local dividerY = statusY + 28
+	local buttonsY = dividerY + 16
+	local hintY = buttonsY + 38
+	return {
+		panelH = hintY + 28,
+		rowsH = rowsH,
+		statusY = statusY,
+		dividerY = dividerY,
+		buttonsY = buttonsY,
+		hintY = hintY,
+	}
+end
 
 -- Fallback keeps the modal renderable if the shared module is ever an older
 -- revision than this script.
@@ -134,8 +189,10 @@ local function ghostButton(
 	button.Name = name
 	button.Position = position
 	button.Size = size
-	button.BackgroundColor3 = theme.PanelLight
-	button.BackgroundTransparency = 0.4
+	-- The chips' fill, one step quieter: a secondary button has to read as a
+	-- surface on the panel, not as a hole in it.
+	button.BackgroundColor3 = theme.Chip or theme.PanelLight
+	button.BackgroundTransparency = 0.35
 	button.BorderSizePixel = 0
 	button.AutoButtonColor = false
 	button.Font = Enum.Font.GothamBold
@@ -165,13 +222,28 @@ end
 function OptionsMenu.create(
 	parent: Instance,
 	theme: Theme,
-	playSound: ((soundId: string, volume: number, pitch: number) -> ())?
+	playSound: ((soundId: string, volume: number, pitch: number) -> ())?,
+	onVisibilityChanged: ((open: boolean) -> ())?
 ): Modal
 	local function sound(soundId: string, volume: number, pitch: number)
 		if playSound then
 			playSound(soundId, volume, pitch)
 		end
 	end
+
+	-- One size for this host's action list, read everywhere below.
+	local layout = layoutFor(#ACTIONS)
+
+	--[[
+		The three surfaces of the panel, resolved once: the window, the cards laid
+		on it and the bind buttons on those. Each is a clear step above the one
+		behind it, because a modal whose every layer is near-black reads as a single
+		gray slab -- most of all over a scrim that already dimmed the screen.
+	]]
+	local surface = theme.Surface or theme.Panel
+	local rowFill = theme.Row or theme.PanelLight
+	local chipFill = theme.Chip or theme.Panel
+	local rowStroke = theme.RowStroke or theme.Stroke
 
 	-- Responsive scale, so the modal still fits a small viewport.
 	local root = Instance.new("Frame")
@@ -199,31 +271,51 @@ function OptionsMenu.create(
 	-- fade -- exists only on CanvasGroup. The click catcher lives on `root`,
 	-- outside this group, and the panel's own rows and footer fit inside it, so
 	-- the group's clipping changes nothing on screen.
+	--
+	-- The group is the fade mask only; what it fades is the plain Frame below it.
+	-- That split is deliberate: a gradient parented to a CanvasGroup tints
+	-- everything the group renders, so the sheen has to live on a frame that owns
+	-- nothing but its own background.
 	local panel = Instance.new("CanvasGroup")
 	panel.Name = "Panel"
 	panel.AnchorPoint = Vector2.new(0.5, 0.5)
 	panel.Position = UDim2.fromScale(0.5, 0.5)
-	panel.Size = UDim2.fromOffset(PANEL_W, PANEL_H)
-	panel.BackgroundColor3 = theme.Panel
-	panel.BackgroundTransparency = 0.04
+	panel.Size = UDim2.fromOffset(PANEL_W, layout.panelH)
+	panel.BackgroundTransparency = 1
 	panel.BorderSizePixel = 0
 	panel.ZIndex = 2
 	panel.GroupTransparency = 1
 	panel.Parent = root
 	corner(panel, 16)
-	stroke(panel, theme.Stroke, 1, 0.4)
+
+	--[[
+		White on purpose. A UIGradient's colours combine with the fill underneath
+		it: painting this frame the ramp's own dark end as well would darken the
+		panel twice, which is how it used to end up as one near-black slab. White
+		lets the ramp supply the exact colours it names, and it stays opaque, so the
+		scrim behind the modal shows through nothing.
+	]]
+	local surfaceFrame = Instance.new("Frame")
+	surfaceFrame.Name = "Surface"
+	surfaceFrame.Size = UDim2.fromScale(1, 1)
+	surfaceFrame.BackgroundColor3 = Color3.new(1, 1, 1)
+	surfaceFrame.BorderSizePixel = 0
+	surfaceFrame.Parent = panel
+	corner(surfaceFrame, 16)
+	stroke(surfaceFrame, rowStroke, 1, 0.45)
 
 	local sheen = Instance.new("UIGradient")
 	sheen.Rotation = 90
 	sheen.Color = ColorSequence.new({
-		ColorSequenceKeypoint.new(0, theme.PanelLight),
-		ColorSequenceKeypoint.new(1, theme.Panel),
+		ColorSequenceKeypoint.new(0, surface),
+		ColorSequenceKeypoint.new(1, Color3.new(
+			surface.R * 0.82,
+			surface.G * 0.82,
+			surface.B * 0.82
+		)),
 	})
-	sheen.Transparency = NumberSequence.new({
-		NumberSequenceKeypoint.new(0, 0.25),
-		NumberSequenceKeypoint.new(1, 0.75),
-	})
-	sheen.Parent = panel
+	sheen.Transparency = NumberSequence.new(0)
+	sheen.Parent = surfaceFrame
 
 	local pop = Instance.new("UIScale")
 	pop.Scale = 1
@@ -292,7 +384,7 @@ function OptionsMenu.create(
 	-- Rows --------------------------------------------------------------------
 	local rowsRoot = Instance.new("Frame")
 	rowsRoot.Name = "Rows"
-	rowsRoot.Position = UDim2.fromOffset(PAD, 122)
+	rowsRoot.Position = UDim2.fromOffset(PAD, ROWS_TOP)
 	rowsRoot.Size = UDim2.new(1, -PAD * 2, 0, 0)
 	rowsRoot.AutomaticSize = Enum.AutomaticSize.Y
 	rowsRoot.BackgroundTransparency = 1
@@ -301,13 +393,16 @@ function OptionsMenu.create(
 	local rowLayout = Instance.new("UIListLayout")
 	rowLayout.FillDirection = Enum.FillDirection.Vertical
 	rowLayout.SortOrder = Enum.SortOrder.LayoutOrder
-	rowLayout.Padding = UDim.new(0, 8)
+	rowLayout.Padding = UDim.new(0, ROW_GAP)
 	rowLayout.Parent = rowsRoot
 
 	local ACCENTS: { [string]: Color3 } = {
 		Attack = theme.Slash,
 		Parry = theme.Parry,
 		Dodge = theme.Dodge,
+		-- Near-white on purpose: this row's glyph has to stay legible on the bind
+		-- chip behind it, and the muted gray it used to use vanished into it.
+		Options = theme.Ink,
 	}
 
 	local rows: { [ActionName]: Row } = {}
@@ -322,7 +417,7 @@ function OptionsMenu.create(
 	local status = newText(
 		panel,
 		"Status",
-		UDim2.fromOffset(PAD, 342),
+		UDim2.fromOffset(PAD, layout.statusY),
 		UDim2.new(1, -PAD * 2, 0, 20),
 		Enum.Font.GothamMedium,
 		12,
@@ -344,12 +439,16 @@ function OptionsMenu.create(
 				continue
 			end
 			local isCapture = captured == action
-			row.chip.Text = if isCapture then "PRESS ANY KEY..." else KeybindManager:Label(action)
-			row.chip.TextColor3 = if isCapture then theme.Ink else row.accent
-			row.chip.BackgroundTransparency = if isCapture then 0 else 0.3
-			row.outline.Color = if isCapture then theme.Accent else theme.Stroke
-			row.outline.Transparency = if isCapture then 0.05 else 0.45
+			row.glyph.Text = if isCapture then "PRESS A KEY..." else KeybindManager:Label(action)
+			row.glyph.TextColor3 = if isCapture then theme.Ink else row.accent
+			row.caption.Text = if isCapture then "ESC CANCELS" else "CLICK TO CHANGE"
+			row.caption.TextColor3 = if isCapture then theme.Accent else theme.Ink
+			row.caption.TextTransparency = if isCapture then 0 else 0.35
+			row.chip.BackgroundTransparency = if isCapture then 0 else 0.05
+			row.outline.Color = if isCapture then theme.Accent else rowStroke
+			row.outline.Transparency = if isCapture then 0.02 else 0.5
 			row.dot.BackgroundTransparency = if isCapture then 0 else 0.25
+			row.card.BackgroundTransparency = if isCapture then 0.08 else 0.2
 		end
 	end
 
@@ -377,6 +476,24 @@ function OptionsMenu.create(
 		end
 	end)
 
+	--[[
+		Arms a capture for one action. Shared by the chip and the row's hit target,
+		so both gestures run the same state machine; clicking the armed row again is
+		its own cancel, which is why a misclick needs no trip to the status line.
+	]]
+	local function beginCapture(action: ActionName)
+		if captured == action then
+			cancelCapture(false)
+			return
+		end
+		sound("rbxasset://sounds/electronicpingshort.wav", 0.16, 1.2)
+		captured = action
+		catcher.Visible = true
+		refresh()
+		local display = KeybindManager.DisplayNames[action] or action
+		setStatus(`Press any key or mouse button for {display}  ·  ESC cancels`, false)
+	end
+
 	for order = 1, #ACTIONS do
 		local action: ActionName = ACTIONS[order]
 		local accent = ACCENTS[action] or theme.Accent
@@ -384,12 +501,27 @@ function OptionsMenu.create(
 		local card = Instance.new("Frame")
 		card.Name = `Row_{action}`
 		card.LayoutOrder = order
-		card.Size = UDim2.new(1, 0, 0, 56)
-		card.BackgroundColor3 = theme.PanelLight
-		card.BackgroundTransparency = 0.7
+		card.Size = UDim2.new(1, 0, 0, ROW_H)
+		card.BackgroundColor3 = rowFill
+		card.BackgroundTransparency = 0.2
 		card.BorderSizePixel = 0
 		card.Parent = rowsRoot
 		corner(card, 10)
+		stroke(card, rowStroke, 1, 0.75)
+
+		--[[
+			The row's own hit target, created first so everything painted after it --
+			the accent tick, the two labels, the bind chip -- draws above it. A click
+			that lands anywhere but the chip still opens the same capture, because
+			"click the row to change it" is the gesture a player tries first.
+		]]
+		local hit = Instance.new("TextButton")
+		hit.Name = "RowHit"
+		hit.Size = UDim2.fromScale(1, 1)
+		hit.BackgroundTransparency = 1
+		hit.Text = ""
+		hit.AutoButtonColor = false
+		hit.Parent = card
 
 		local dot = Instance.new("Frame")
 		dot.Name = "Dot"
@@ -429,50 +561,81 @@ function OptionsMenu.create(
 		chip.AnchorPoint = Vector2.new(1, 0.5)
 		chip.Position = UDim2.new(1, -12, 0.5, 0)
 		chip.Size = UDim2.fromOffset(160, 36)
-		chip.BackgroundColor3 = theme.Panel
-		chip.BackgroundTransparency = 0.3
+		chip.BackgroundColor3 = chipFill
+		chip.BackgroundTransparency = 0.05
 		chip.BorderSizePixel = 0
 		chip.AutoButtonColor = false
-		chip.Font = Enum.Font.GothamBold
-		chip.TextScaled = true
-		chip.TextColor3 = accent
 		chip.Text = ""
 		chip.Parent = card
 		corner(chip, 8)
-		local outline = stroke(chip, theme.Stroke, 1, 0.45)
+		local outline = stroke(chip, rowStroke, 1, 0.5)
 
 		local chipPad = Instance.new("UIPadding")
 		chipPad.PaddingLeft = UDim.new(0, 8)
 		chipPad.PaddingRight = UDim.new(0, 8)
 		chipPad.Parent = chip
 
-		chip.MouseEnter:Connect(function()
+		-- Two lines, because one glyph reads as a label and a label reads as "not
+		-- mine to touch": the key on top, what clicking it does underneath.
+		local glyph = Instance.new("TextLabel")
+		glyph.Name = "Glyph"
+		glyph.Position = UDim2.fromOffset(0, 1)
+		glyph.Size = UDim2.new(1, 0, 0, 19)
+		glyph.BackgroundTransparency = 1
+		glyph.Font = Enum.Font.GothamBold
+		glyph.TextScaled = true
+		glyph.TextColor3 = accent
+		glyph.Text = ""
+		glyph.Parent = chip
+
+		local caption = Instance.new("TextLabel")
+		caption.Name = "Caption"
+		caption.Position = UDim2.fromOffset(0, 20)
+		caption.Size = UDim2.new(1, 0, 0, 14)
+		caption.BackgroundTransparency = 1
+		caption.Font = Enum.Font.GothamBold
+		caption.TextSize = 10
+		-- Ink at a transparency, not the muted gray: this caption is the thing that
+		-- tells a player the chip is a button, so it has to survive the chip fill.
+		caption.TextColor3 = theme.Ink
+		caption.TextTransparency = 0.35
+		caption.Text = "CLICK TO CHANGE"
+		caption.Parent = chip
+
+		-- One hover state for the whole row: the card lifts and the bind outline takes
+		-- the action's colour, whether the mouse arrived over the chip or the row.
+		local function hover(on: boolean)
 			if captured == action then
 				return
 			end
-			TweenService:Create(outline, TweenInfo.new(0.12), { Color = accent, Transparency = 0.15 }):Play()
+			TweenService:Create(card, TweenInfo.new(0.12), { BackgroundTransparency = if on then 0.02 else 0.2 }):Play()
+			TweenService:Create(outline, TweenInfo.new(0.12), { Color = if on then accent else rowStroke, Transparency = if on then 0.1 else 0.5 }):Play()
+		end
+
+		hit.MouseEnter:Connect(function()
+			hover(true)
+		end)
+		hit.MouseLeave:Connect(function()
+			hover(false)
+		end)
+		hit.Activated:Connect(function()
+			beginCapture(action)
+		end)
+		chip.MouseEnter:Connect(function()
+			hover(true)
 		end)
 		chip.MouseLeave:Connect(function()
-			if captured == action then
-				return
-			end
-			TweenService:Create(outline, TweenInfo.new(0.16), { Color = theme.Stroke, Transparency = 0.45 }):Play()
+			hover(false)
 		end)
 		chip.Activated:Connect(function()
-			if captured == action then
-				cancelCapture(false)
-				return
-			end
-			sound("rbxasset://sounds/electronicpingshort.wav", 0.16, 1.2)
-			captured = action
-			catcher.Visible = true
-			refresh()
-			local display = KeybindManager.DisplayNames[action] or action
-			setStatus(`Press any key or mouse button for {display}  ·  ESC cancels`, false)
+			beginCapture(action)
 		end)
 
 		rows[action] = {
+			card = card,
 			chip = chip,
+			glyph = glyph,
+			caption = caption,
 			outline = outline,
 			dot = dot,
 			accent = accent,
@@ -480,11 +643,11 @@ function OptionsMenu.create(
 	end
 
 	-- Status + footer ---------------------------------------------------------
-	status.Text = "Click a bind to change it."
+	status.Text = "Click a bind -- or a whole row -- to change it."
 
 	local footerDivider = Instance.new("Frame")
 	footerDivider.Name = "FooterDivider"
-	footerDivider.Position = UDim2.fromOffset(PAD, 376)
+	footerDivider.Position = UDim2.fromOffset(PAD, layout.dividerY)
 	footerDivider.Size = UDim2.new(1, -PAD * 2, 0, 1)
 	footerDivider.BackgroundColor3 = theme.Stroke
 	footerDivider.BackgroundTransparency = 0.65
@@ -495,14 +658,14 @@ function OptionsMenu.create(
 		panel,
 		theme,
 		"RestoreDefaults",
-		UDim2.fromOffset(PAD, 392),
+		UDim2.fromOffset(PAD, layout.buttonsY),
 		UDim2.fromOffset(176, 34),
 		"RESTORE DEFAULTS"
 	)
 
 	local closeButton = Instance.new("TextButton")
 	closeButton.Name = "Close"
-	closeButton.Position = UDim2.fromOffset(PANEL_W - PAD - 104, 392)
+	closeButton.Position = UDim2.fromOffset(PANEL_W - PAD - 104, layout.buttonsY)
 	closeButton.Size = UDim2.fromOffset(104, 34)
 	closeButton.BackgroundColor3 = theme.Accent
 	closeButton.BackgroundTransparency = 0
@@ -525,7 +688,7 @@ function OptionsMenu.create(
 	local footerHint = newText(
 		panel,
 		"FooterHint",
-		UDim2.fromOffset(PAD, 428),
+		UDim2.fromOffset(PAD, layout.hintY),
 		UDim2.new(1, -PAD * 2, 0, 16),
 		Enum.Font.GothamMedium,
 		11,
@@ -577,11 +740,16 @@ function OptionsMenu.create(
 		captured = nil
 		catcher.Visible = false
 		root.Visible = true
+		-- Announced on intent, not on the end of the fade: a host that hands the
+		-- cursor over must not wait 0.24s while the panel is already on screen.
+		if onVisibilityChanged then
+			onVisibilityChanged(true)
+		end
 		scrim.BackgroundTransparency = 0.72
 		panel.GroupTransparency = 1
 		panel.Position = UDim2.new(0.5, 0, 0.5, 22)
 		pop.Scale = 0.97
-		setStatus("Click a bind to change it.", false)
+		setStatus("Click a bind -- or a whole row -- to change it.", false)
 		refresh()
 
 		TweenService:Create(scrim, TweenInfo.new(0.22), { BackgroundTransparency = 0.45 }):Play()
@@ -597,6 +765,9 @@ function OptionsMenu.create(
 			return
 		end
 		cancelCapture(true)
+		if onVisibilityChanged then
+			onVisibilityChanged(false)
+		end
 		closeSerial += 1
 		local serial = closeSerial
 		TweenService:Create(scrim, TweenInfo.new(0.18), { BackgroundTransparency = 1 }):Play()
@@ -665,7 +836,7 @@ function OptionsMenu.create(
 	local camera = workspace.CurrentCamera
 	local function fitToViewport()
 		local viewport = camera.ViewportSize
-		fit.Scale = math.clamp(math.min(viewport.X / (PANEL_W + 80), viewport.Y / (PANEL_H + 80)), 0.62, 1)
+		fit.Scale = math.clamp(math.min(viewport.X / (PANEL_W + 80), viewport.Y / (layout.panelH + 80)), 0.62, 1)
 	end
 
 	camera:GetPropertyChangedSignal("ViewportSize"):Connect(fitToViewport)
@@ -678,6 +849,9 @@ function OptionsMenu.create(
 		close = close,
 		isOpen = function(): boolean
 			return root.Visible
+		end,
+		isCapturing = function(): boolean
+			return captured ~= nil
 		end,
 	}
 end

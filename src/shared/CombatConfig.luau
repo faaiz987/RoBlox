@@ -164,6 +164,17 @@ CombatConfig.Player = {
 	-- Health restored to every living player when a wave is cleared.
 	WaveClearHeal = 0.2,
 	LifestealPerParry = 0,
+
+	--[[
+		Mid-air jumps every player gets before any perk is picked. One means the
+		double jump is a base ability rather than a card the player has to be offered,
+		which is what it always wanted to be; the DoubleJump perk now stacks a second
+		air jump on top of it (see PerkDatabase).
+	]]
+	AirJumps = 1,
+	-- Upward impulse of that mid-air jump, in studs/second: a touch over the stock
+	-- jump power, so the second kick reads as the stronger one.
+	AirJumpImpulse = 54,
 }
 
 CombatConfig.Block = {
@@ -620,6 +631,8 @@ CombatConfig.Fx = {
 	ParryColor = Color3.fromRGB(255, 214, 108),
 	ShadowDashColor = Color3.fromRGB(88, 34, 122),
 	DodgeColor = Color3.fromRGB(160, 214, 255),
+	-- The mid-air jump's puff, and the DoubleJump perk's card colour.
+	AirJumpColor = Color3.fromRGB(150, 224, 255),
 	HitSpark = "rbxasset://textures/particles/sparkles_main.dds",
 	-- Stock client sounds: swap for uploaded asset ids for final polish.
 	ParryClash = "rbxasset://sounds/swordslash.wav",
@@ -727,7 +740,7 @@ function CombatConfig.baseStats(): Stats
 		lifestealPerParry = CombatConfig.Player.LifestealPerParry,
 		instantPoiseBreak = false,
 		shadowDash = false,
-		extraJumps = 0,
+		extraJumps = CombatConfig.Player.AirJumps,
 	}
 end
 

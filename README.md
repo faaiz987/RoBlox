@@ -30,7 +30,12 @@ For more help, check out [the Rojo documentation](https://rojo.space/docs).
 | Sword attack (3-hit stance combo) | Left Click / `R2` |
 | Parry (tap), guard (hold) | `F` / `L2` |
 | Directional dodge dash | `Q`, `Shift`, or `L1` + movement direction |
-| Extra air jump | Press Jump mid-air (needs the *Double Jump* perk) |
+| Air jump (double jump) | Press Jump again while airborne - one per airtime |
+| Options / keybinds | `O` mid-run, or `OPTIONS` on the title screen |
+
+The air jump is part of every fighter's kit from wave one: jump, then jump again in mid-air for a second kick, marked by a shockwave and a puff of sparks at your feet. The *Air Step* perk stacks a third one on top.
+
+Every one of those is rebindable, including the `Options` key itself: open the panel and click a bind chip (or anywhere on its row), then press the key you want. `RESTORE DEFAULTS` puts the shipped controls back. Rebinds are per-session.
 
 Three attacks inside the `1.2s` combo window finish with the heavy finisher *Heaven's Fall*.
 
@@ -51,6 +56,7 @@ src/
     CombatConfig.luau            timings, combo steps, enemy archetypes, poses, attributes
     RigAnimationPack.luau        bakes rig clips into KeyframeSequences + reports their ids
     Animations.luau              optional-clip plumbing: id -> Animation instance -> fallback
+    KeybindManager.luau          the action -> input store every control reads
     PerkDatabase.luau            perk registry, rolling, stat folding
     Remotes.luau                 remote/signal registry + payload types
   server/                        -> ServerScriptService.Server
@@ -58,10 +64,15 @@ src/
     EnemyAI.server.luau          enemy rigs, telegraphs, strike resolution, poise
     WaveManager.server.luau      escalation curve, perk pauses, party heal
     KatanaFactory.luau           shared sword rig builder + arm poser
+    EnvironmentSetup.server.luau arena floor, wooden palisade wall, lamp posts, dusk lighting
   client/                        -> StarterPlayer.StarterPlayerScripts.Client
     CombatController.client.luau input, camera shake/FOV, sword posing, telegraph UI
     PerkUI.client.luau           perk cards, wave banner, HUD, health bar
     CombatHUD.client.luau        control hints + live parry/dodge cooldown badges
+    MainMenuUI.client.luau       title screen, credits, [ OPTIONS ]
+    OptionsOverlay.client.luau   the same options panel, reachable mid-run
+    OptionsMenu.luau             the keybind modal itself (shared by both hosts)
+    UiTheme.luau                 one palette for every menu
 ```
 
 ## Animating a rig

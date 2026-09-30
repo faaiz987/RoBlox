@@ -373,6 +373,65 @@ local function sparkBurst(position: Vector3, color: Color3, count: number, speed
 	Debris:AddItem(anchor, 1.2)
 end
 
+--[[
+	The mid-air jump's signature: a flat shockwave at the feet, a breath of upward
+	drift and a small outward scatter. Purely local -- the server never hears about
+	it -- and everything here dies on its own, so a chain of air jumps cannot pile
+	parts up in the workspace.
+]]
+local function airJumpPuff(root: BasePart)
+	-- The feet, not the root: a HumanoidRootPart floats about two studs up the body
+	-- on both R6 and R15, and a puff from the chest reads as a bug.
+	local position = root.Position - Vector3.new(0, 2, 0)
+
+	local disc = Instance.new("Part")
+	disc.Name = "CB_AirJumpRing"
+	-- A cylinder's axis runs along X, so this stands it up as a flat disc.
+	disc.Shape = Enum.PartType.Cylinder
+	disc.Size = Vector3.new(0.1, 3.2, 3.2)
+	disc.CFrame = CFrame.new(position) * CFrame.Angles(0, 0, math.rad(90))
+	disc.Material = Enum.Material.Neon
+	disc.Color = FXCFG.AirJumpColor
+	disc.Transparency = 0.25
+	disc.CanCollide = false
+	disc.CanQuery = false
+	disc.CanTouch = false
+	disc.Anchored = true
+	disc.CastShadow = false
+	disc.Parent = workspace
+
+	TweenService:Create(disc, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Size = Vector3.new(0.1, 6.2, 6.2),
+		Transparency = 1,
+	}):Play()
+	Debris:AddItem(disc, 0.5)
+
+	-- Drift rising off the kick: the one particle shape that says "pushed off"
+	-- rather than "hit", which keeps the jump from reading as an impact.
+	local drift = Instance.new("ParticleEmitter")
+	drift.Name = "CB_AirJumpDrift"
+	drift.Color = ColorSequence.new(FXCFG.AirJumpColor)
+	drift.Lifetime = NumberRange.new(0.25, 0.45)
+	drift.Speed = NumberRange.new(6, 13)
+	drift.SpreadAngle = Vector2.new(24, 24)
+	drift.Acceleration = Vector3.new(0, 14, 0)
+	drift.Rate = 0
+	drift.LightEmission = 0.8
+	drift.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.3),
+		NumberSequenceKeypoint.new(1, 0),
+	})
+	drift.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.15),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	drift.Parent = disc
+	drift:Emit(14)
+
+	-- Plus the outward sparks every other hit in the game already speaks.
+	sparkBurst(position, FXCFG.AirJumpColor, 10, 14)
+end
+
 -- ---------------------------------------------------------------------------
 -- Screen feedback (flash + damage vignette)
 -- ---------------------------------------------------------------------------
@@ -1973,10 +2032,24 @@ bindKeybinds()
 KeybindManager.OnBindChanged.Event:Connect(bindKeybinds)
 
 -- ---------------------------------------------------------------------------
--- Double jump
+-- Air jump (the "double jump")
 -- ---------------------------------------------------------------------------
 
-local function bindDoubleJump(humanoid: Humanoid)
+--[[
+	Faster than this and the body is still climbing on the previous boost.
+	JumpRequest is documented to fire twice for a single press, and the engine's
+	auto-hop keeps requesting while the key is held; either one would otherwise
+	spend the air jump on the same frame the ground jump left. Nothing deliberate
+	happens while the body is climbing this fast -- gravity has it near the apex by
+	the time the player's second tap lands. That is about the first seventh of a
+	second of the hop, and a request refused here costs nothing -- the allowance is
+	only spent by a jump that actually fires, so an early tap can simply be repeated.
+]]
+local AIR_JUMP_MAX_RISE = 26
+
+-- Refills the allowance the moment the feet touch something: landing, running
+-- again, sitting, standing up. Everything that means "grounded".
+local function bindAirJumpAllowance(humanoid: Humanoid)
 	state.airJumpsUsed = 0
 	humanoid.StateChanged:Connect(function(_, newState: Enum.HumanoidStateType)
 		if
@@ -1997,16 +2070,34 @@ UserInputService.JumpRequest:Connect(function()
 		return
 	end
 
-	local extraJumps = attrNumber(ATTR.ExtraJumps, 0)
-	if extraJumps <= 0 or state.airJumpsUsed >= extraJumps then
+	--[[
+		Both airborne states count. The Humanoid sits in `Jumping` for the first
+		frames of a hop before settling into `Freefall`, and a player who taps twice
+		quickly is asking for the second jump while still in the first of those. Being
+		on the ground is never in question here: a grounded JumpRequest is the engine's
+		own jump, and the allowance only refills on landing.
+	]]
+	local humanoidState = humanoid:GetState()
+	if humanoidState ~= Enum.HumanoidStateType.Freefall and humanoidState ~= Enum.HumanoidStateType.Jumping then
 		return
 	end
-	if humanoid:GetState() ~= Enum.HumanoidStateType.Freefall then
+	if root.AssemblyLinearVelocity.Y > AIR_JUMP_MAX_RISE then
+		return
+	end
+
+	-- Base allowance plus every perk that granted one, folded server-side.
+	local extraJumps = attrNumber(ATTR.ExtraJumps, CombatConfig.Player.AirJumps)
+	if extraJumps <= 0 or state.airJumpsUsed >= extraJumps then
 		return
 	end
 
 	state.airJumpsUsed += 1
-	root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 54, root.AssemblyLinearVelocity.Z)
+	root.AssemblyLinearVelocity = Vector3.new(
+		root.AssemblyLinearVelocity.X,
+		CombatConfig.Player.AirJumpImpulse,
+		root.AssemblyLinearVelocity.Z
+	)
+	airJumpPuff(root)
 	playOneShot(FXCFG.DodgeWhoosh, 0.3, 1.5, root)
 	addFov(4)
 	addRoll(-1.5)
@@ -2019,7 +2110,7 @@ local function bindCharacter(character: Model)
 
 	local humanoid = character:WaitForChild("Humanoid", 10)
 	if humanoid and humanoid:IsA("Humanoid") then
-		bindDoubleJump(humanoid)
+		bindAirJumpAllowance(humanoid)
 		-- A body must not keep the last swing's pose on its shoulder after death,
 		-- nor the default idle layers weighted out.
 		humanoid.Died:Once(function()

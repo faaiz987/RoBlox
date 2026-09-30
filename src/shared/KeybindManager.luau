@@ -6,6 +6,7 @@
 	place a control is ever decided.
 
 		Attack -> Left Mouse      Parry -> F      Dodge -> Left Shift
+		Options -> O
 
 	A ModuleScript, not a service: keybinds are per-machine player preference, so
 	the store lives in the client's own require cache and a rebind never needs a
@@ -26,12 +27,12 @@
 
 local KeybindManager = {}
 
-export type ActionName = "Attack" | "Parry" | "Dodge"
+export type ActionName = "Attack" | "Parry" | "Dodge" | "Options"
 
 -- One input a player action can answer to.
 export type Input = Enum.UserInputType | Enum.KeyCode
 
-local ACTIONS: { ActionName } = { "Attack", "Parry", "Dodge" }
+local ACTIONS: { ActionName } = { "Attack", "Parry", "Dodge", "Options" }
 
 KeybindManager.Actions = ACTIONS
 
@@ -41,18 +42,27 @@ KeybindManager.DisplayNames = {
 	Attack = "Light Attack",
 	Parry = "Parry / Block",
 	Dodge = "Dodge Dash",
+	Options = "Options Menu",
 } :: { [string]: string }
 
 KeybindManager.Descriptions = {
 	Attack = "Three-hit stance combo",
 	Parry = "0.2s window, hold to guard",
 	Dodge = "Dash with i-frames",
+	Options = "Shows this panel mid-run",
 } :: { [string]: string }
 
+--[[
+	`Options` is an action like any other on purpose: the mid-run options overlay
+	binds it (ContextActionService) and the modal renders it as a fourth row, so
+	the panel's own hotkey is rebindable -- and the duplicate rule below is what
+	stops a combat bind from ending up on the same key.
+]]
 local DEFAULTS: { [string]: Input } = {
 	Attack = Enum.UserInputType.MouseButton1,
 	Parry = Enum.KeyCode.F,
 	Dodge = Enum.KeyCode.LeftShift,
+	Options = Enum.KeyCode.O,
 }
 
 --[[
@@ -64,6 +74,9 @@ local EXTRAS: { [string]: { Input } } = {
 	Attack = { Enum.KeyCode.ButtonR2 },
 	Parry = { Enum.KeyCode.ButtonL2 },
 	Dodge = { Enum.KeyCode.Q, Enum.KeyCode.ButtonL1 },
+	-- None for Options: the overlay binds the player's one bind, and on a gamepad
+	-- the touch button it creates is not used -- the row is still rebindable.
+	Options = {},
 }
 
 -- The live store. Written only through SetBind / RestoreDefaults.
