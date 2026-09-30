@@ -29,6 +29,7 @@ local ARENA = CombatConfig.Arena
 local TAG = CombatConfig.Tags.Enemy
 
 local waveRemote = Remotes.server(NAMES.WaveState)
+local startRemote = Remotes.server(NAMES.StartWave)
 local spawnSignal = Remotes.signal(NAMES.SpawnEnemy)
 local waveClearedSignal = Remotes.signal(NAMES.WaveCleared)
 local perkSelectedSignal = Remotes.signal(NAMES.PerkSelected)
@@ -52,11 +53,17 @@ local FIRST_WAVE_DELAY = 6
 local INTERMISSION = 6
 local PERK_CHOICE_TIMEOUT = 30
 local FIELD_POLL = 0.5
+-- How long the lobby waits for every player to press PLAY before the run starts
+-- anyway, so one idle client can never hold the server hostage.
+local START_TIMEOUT = 90
 
 local phase: Remotes.WavePhase = "Idle"
 local waveNumber = 0
 local enemiesTotal = 0
 local enemiesSpawned = 0
+local runStarted = false
+-- Players who have pressed PLAY on the main menu.
+local readyPlayers = {} :: { [Player]: boolean }
 local rng = Random.new(DateTime.now().UnixTimestampMillis % 2 ^ 31)
 
 -- ---------------------------------------------------------------------------
@@ -260,6 +267,33 @@ local function intermission(seconds: number, announcement: string)
 	task.wait(seconds)
 end
 
+--[[
+	Menu gate.
+	The first wave belongs to the player: the run stays in "Idle" until every
+	present player has asked for it through the main menu, or the lobby times out.
+	A player who leaves is dropped from the tally, so the last one to press PLAY
+	starts the fight immediately rather than waiting out the timeout.
+]]
+local function waitForStart(): boolean
+	local deadline = os.clock() + START_TIMEOUT
+	while os.clock() < deadline do
+		local players = Players:GetPlayers()
+		if #players > 0 then
+			local pending = 0
+			for _, player in players do
+				if not readyPlayers[player] then
+					pending += 1
+				end
+			end
+			if pending == 0 then
+				return true
+			end
+		end
+		task.wait(0.25)
+	end
+	return false
+end
+
 -- ---------------------------------------------------------------------------
 -- Run loop
 -- ---------------------------------------------------------------------------
@@ -268,6 +302,18 @@ enemyKilledSignal.Event:Connect(function()
 	if phase == "Wave" then
 		broadcast() -- keep the counter honest between polls
 	end
+end)
+
+startRemote.OnServerEvent:Connect(function(player: Player)
+	if runStarted then
+		-- Already fighting: a late joiner's PLAY is a no-op, not an error.
+		return
+	end
+	readyPlayers[player] = true
+end)
+
+Players.PlayerRemoving:Connect(function(player: Player)
+	readyPlayers[player] = nil
 end)
 
 Players.PlayerAdded:Connect(function(player: Player)
@@ -283,6 +329,14 @@ task.spawn(function()
 	while #Players:GetPlayers() == 0 do
 		task.wait(1)
 	end
+
+	-- The menu owns the opening: nobody is thrown into wave 1 from a loading screen.
+	if waitForStart() then
+		print("[WaveManager] Lobby ready -- starting the run.")
+	else
+		print("[WaveManager] Start timed out -- starting the run anyway.")
+	end
+	runStarted = true
 
 	intermission(FIRST_WAVE_DELAY, "PREPARE YOUR BLADE")
 

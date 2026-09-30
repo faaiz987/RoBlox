@@ -108,6 +108,29 @@ export type Stats = {
 
 export type Vector3Pose = { x: number, y: number, z: number }
 
+-- One clip-less procedural beat: where the sword arm lands and how long each phase
+-- lasts. The client drives it through TweenService onto the shoulder's rest C0.
+export type ProceduralBeat = {
+	id: string,
+	-- Where the shoulder lands for the cut, in degrees on top of its rest C0.
+	pose: Vector3Pose,
+	-- Seconds to accelerate into the pose.
+	out: number,
+	-- Seconds the pose is parked (at least) before the arm eases home.
+	hold: number,
+	-- Seconds to ease home afterwards.
+	back: number,
+	-- Heavy only: the overhead raise, and the slam that follows it.
+	raise: Vector3Pose?,
+	slam: number?,
+	-- Heavy only: FOV kick in degrees, fired on the slam beat.
+	fovKick: number?,
+}
+
+-- A parry beat adds the clash extension: how much longer the block is held when
+-- the incoming blade is caught inside the window.
+export type ParryBeat = ProceduralBeat & { successHold: number }
+
 -- ---------------------------------------------------------------------------
 -- Core timings (the numbers the brief pins down)
 -- ---------------------------------------------------------------------------
@@ -141,6 +164,17 @@ CombatConfig.Player = {
 	-- Health restored to every living player when a wave is cleared.
 	WaveClearHeal = 0.2,
 	LifestealPerParry = 0,
+
+	--[[
+		Mid-air jumps every player gets before any perk is picked. One means the
+		double jump is a base ability rather than a card the player has to be offered,
+		which is what it always wanted to be; the DoubleJump perk now stacks a second
+		air jump on top of it (see PerkDatabase).
+	]]
+	AirJumps = 1,
+	-- Upward impulse of that mid-air jump, in studs/second: a touch over the stock
+	-- jump power, so the second kick reads as the stronger one.
+	AirJumpImpulse = 54,
 }
 
 CombatConfig.Block = {
@@ -381,6 +415,10 @@ CombatConfig.RigParts = {
 	WristJointNames = { "RightWrist", "Right Wrist" }, -- 👈 ADD THIS LINE
 	KatanaName = "Katana",
 	KatanaGripName = "KatanaGrip",
+	-- Blade ribbon endpoints, current name first; the rest are adopted so a blade
+	-- built by an older revision keeps its attachments instead of gaining clones.
+	HiltAttachmentNames = { "HiltAttachment", "Hilt" },
+	TipAttachmentNames = { "TipAttachment", "Tip" },
 }
 
 --[[
@@ -401,30 +439,85 @@ CombatConfig.SwingRig = {
 }
 
 -- ---------------------------------------------------------------------------
--- Pose data (degrees) -- shared so server + client animate identically.
+-- Enemy pose data (degrees) -- shared so server + client animate identically.
 --   Angles are applied to the shoulder joint C0, pivoting on the real joint.
+--   Player poses are not here: they are tuned per beat and live in
+--   `CombatConfig.Procedural`, so one table owns the sword arm.
 -- ---------------------------------------------------------------------------
 
 CombatConfig.Poses = {
-	-- Light slash: wind arm back, then cut through.
-	SlashWindup = { x = -22, y = -16, z = 34 } :: Vector3Pose,
-	SlashImpact = { x = 96, y = 12, z = -18 } :: Vector3Pose,
-	SlashAlternate = { x = -16, y = 18, z = -34 } :: Vector3Pose,
-
-	-- Heavy finisher: overhead raise, then a full body slam.
-	HeavyWindup = { x = 152, y = 0, z = -12 } :: Vector3Pose,
-	HeavyImpact = { x = 38, y = 0, z = 8 } :: Vector3Pose,
-
-	-- Parry / guard: blade held vertical in front of the face.
-	ParryGuard = { x = 118, y = -6, z = -8 } :: Vector3Pose,
-	ParryRiposte = { x = 62, y = -18, z = -22 } :: Vector3Pose,
-
 	-- Enemy windups are deliberately huge so the tell is unmissable.
 	EnemyWindup = { x = 158, y = 0, z = -16 } :: Vector3Pose,
 	EnemyUnparryableWindup = { x = 208, y = 0, z = 22 } :: Vector3Pose,
 	EnemyStrike = { x = 30, y = 0, z = 10 } :: Vector3Pose,
 	EnemyStagger = { x = -54, y = 0, z = 30 } :: Vector3Pose,
 	EnemyStun = { x = -34, y = 0, z = 14 } :: Vector3Pose,
+}
+
+--[[
+	Procedural arm & sword animation.
+	---------------------------------
+	Every swing and parry a rig gets with no authored clip and no asset id: a small
+	number of beats (`out` -> `hold` -> `back`) tweened onto the shoulder joint's
+	captured rest C0, plus the forearm fold / wrist snap / torso turn from
+	`CombatConfig.SwingRig`.
+
+	Why C0 and not `Motor6D.Transform`: the default `Animate` script -- and every
+	playing AnimationTrack -- writes `Transform` on these joints every frame, so a
+	script that poses `Transform` is overwritten before it can render. C0 composes
+	*under* the animation instead, which is why a swing stays visible over an idle or
+	walk cycle, and why the angle written here is the same angle a baked clip carries.
+
+	Angles are degrees per axis: X = pitch (raises the blade through the shoulder's own
+	axis), Y = yaw (carries it across the body), Z = roll (blade twist). Timings are
+	nominal: `out` + `hold` is matched against the combo step's server windup, so the
+	blade is still parked in the cut the moment the hitbox resolves. Flip a sign with
+	`Flip` if a rig reads mirrored.
+]]
+CombatConfig.Procedural = {
+	-- One-line mirror fix, applied to every procedural pose.
+	Flip = { x = 1, y = 1, z = 1 } :: Vector3Pose,
+
+	-- Indexed by combo step, exactly like `Combo.Steps`.
+	Combo = {
+		{
+			id = "slash1",
+			-- Slash 1 -- light, right to left.
+			pose = { x = -45, y = 60, z = -30 } :: Vector3Pose,
+			out = 0.08,
+			hold = 0.05,
+			back = 0.12,
+		},
+		{
+			id = "slash2",
+			-- Slash 2 -- light, left to right.
+			pose = { x = -30, y = -70, z = 40 } :: Vector3Pose,
+			out = 0.08,
+			hold = 0.05,
+			back = 0.12,
+		},
+		{
+			id = "heavy",
+			-- Slash 3 -- overhead finisher: raise, pause at the top of the arc, slam.
+			raise = { x = 110, y = 0, z = 0 } :: Vector3Pose,
+			pose = { x = -80, y = 0, z = 0 } :: Vector3Pose,
+			out = 0.1, -- the raise
+			hold = 0.15, -- the visible wind-up pause
+			slam = 0.06, -- the cut itself: it lands on the server's windup
+			back = 0.2,
+			fovKick = 7,
+		},
+	} :: { ProceduralBeat },
+
+	-- Parry / block: the blade is held across the chest and face for the whole parry
+	-- window. A clash extends the hold by `successHold` before easing home.
+	Parry = {
+		pose = { x = -10, y = 45, z = 85 } :: Vector3Pose,
+		out = 0.05,
+		hold = CombatConfig.Timings.ParryWindow,
+		successHold = 0.1,
+		back = 0.15,
+	} :: ParryBeat,
 }
 
 -- ---------------------------------------------------------------------------
@@ -440,7 +533,8 @@ CombatConfig.Poses = {
 --   To fill a slot: add the `Animation` instance to the rig (named after one of the
 --   aliases below) or paste a published `rbxassetid://`. `RigAnimationPack`
 --   authors and previews rig clips; `RigAnimationPack.STOCK` lists Roblox's own
---   walk / run / sword ids for rigs that can use them.
+--   walk / run / sword ids for rigs that can use them, and `Stock` below is the
+--   runtime fallback a player's swing reaches for when a slot is empty.
 -- ---------------------------------------------------------------------------
 
 CombatConfig.Animations = {
@@ -469,6 +563,27 @@ CombatConfig.Animations = {
 		Walk = "",
 		Run = "",
 	} :: { [string]: string },
+
+	--[[
+		Stock fallback clips.
+		Roblox's own sword swings: they need no asset ownership and load for every
+		account, so a rig with nothing authored still animates. Keys are prefixed so
+		they can never collide with an authored slot (the Animations cache is keyed by
+		name, not by scope), and R15 clips cannot drive an R6 rig, so each rig type
+		carries its own ids. CombatController plays these at
+		AnimationPriority.Action4, above the default `Animate` layers.
+	]]
+	Stock = {
+		R15 = {
+			StockSlash = "rbxassetid://507770238",
+			StockHeavy = "rbxassetid://507770453",
+		},
+		R6 = {
+			-- Only one stock slash exists for R6; the finisher reuses it.
+			StockSlash = "rbxassetid://129961376",
+			StockHeavy = "rbxassetid://129961376",
+		},
+	} :: { [string]: { [string]: string } },
 
 	-- Enemy clips. The wave rigs are R6 and script-driven, so these are additive:
 	-- when they are empty EnemyAI plays its procedural stride instead.
@@ -516,6 +631,8 @@ CombatConfig.Fx = {
 	ParryColor = Color3.fromRGB(255, 214, 108),
 	ShadowDashColor = Color3.fromRGB(88, 34, 122),
 	DodgeColor = Color3.fromRGB(160, 214, 255),
+	-- The mid-air jump's puff, and the DoubleJump perk's card colour.
+	AirJumpColor = Color3.fromRGB(150, 224, 255),
 	HitSpark = "rbxasset://textures/particles/sparkles_main.dds",
 	-- Stock client sounds: swap for uploaded asset ids for final polish.
 	ParryClash = "rbxasset://sounds/swordslash.wav",
@@ -623,7 +740,7 @@ function CombatConfig.baseStats(): Stats
 		lifestealPerParry = CombatConfig.Player.LifestealPerParry,
 		instantPoiseBreak = false,
 		shadowDash = false,
-		extraJumps = 0,
+		extraJumps = CombatConfig.Player.AirJumps,
 	}
 end
 

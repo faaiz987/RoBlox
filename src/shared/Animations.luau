@@ -5,8 +5,10 @@
 	Animation-track plumbing shared by the player controller and the enemy AI, with
 	one hard guarantee: **loading never throws and never hands back a dead track**.
 
-	Every combat animation in this game is optional. A key (e.g. "Slash1")
-	resolves in this order:
+	Every combat animation in this game is optional. `kind` picks the id table
+	("Player", "PlayerR6" for an R6 avatar, "Enemy", or "Stock" for Roblox's own
+	universally loadable fallbacks), and a key (e.g. "Slash1") resolves in this
+	order:
 
 	  1. An asset id from `CombatConfig.Animations` -- empty string means "not
 	     authored yet", which is the state a freshly synced place is in.
@@ -28,7 +30,7 @@ local CombatConfig = require(ReplicatedStorage.Shared.CombatConfig)
 
 local Animations = {}
 
-export type Kind = "Player" | "Enemy"
+export type Kind = "Player" | "Enemy" | "Stock"
 
 type Entry = {
 	animation: Animation?,
@@ -51,7 +53,12 @@ local function scopeFor(model: Model, kind: Kind): { [string]: string }
 		return ANIM_CFG.Enemy
 	end
 	local humanoid = model:FindFirstChildOfClass("Humanoid")
-	if humanoid and humanoid.RigType == Enum.HumanoidRigType.R6 then
+	local r6 = humanoid ~= nil and humanoid.RigType == Enum.HumanoidRigType.R6
+	if kind == "Stock" then
+		-- Roblox's own clips, used when nothing is authored on the rig.
+		return if r6 then ANIM_CFG.Stock.R6 else ANIM_CFG.Stock.R15
+	end
+	if r6 then
 		return ANIM_CFG.PlayerR6
 	end
 	return ANIM_CFG.Player
@@ -139,9 +146,10 @@ end
 --[[
 	Memoised track for `key`, or nil when the rig has no usable clip.
 	Loading is attempted exactly once per model+key: a missing asset is not retried
-	every swing.
+	every swing. `priority` is written onto the Animation asset before it is loaded,
+	so the engine hands back a track that already sits on that layer.
 ]]
-function Animations.track(model: Model, key: string, kind: Kind?): AnimationTrack?
+function Animations.track(model: Model, key: string, kind: Kind?, priority: Enum.AnimationPriority?): AnimationTrack?
 	local entries = entriesFor(model)
 	local entry = entries[key]
 
@@ -151,6 +159,11 @@ function Animations.track(model: Model, key: string, kind: Kind?): AnimationTrac
 		entry = fresh
 
 		local animation = describe(model, key, kind or "Player")
+		if animation and priority then
+			pcall(function()
+				animation.Priority = priority
+			end)
+		end
 		local animator = animatorFor(model)
 		if animation and animator then
 			fresh.animation = animation
@@ -173,7 +186,8 @@ end
 --[[
 	Plays a track and returns it, or returns nil so the caller runs its procedural
 	fallback. `speed` scales playback (attack-speed perks), `weight` blends it
-	against the rig's own locomotion.
+	against the rig's own locomotion, and `priority` lifts the track above the
+	default `Animate` layers (Action4 for a combat swing).
 ]]
 function Animations.play(
 	model: Model,
@@ -181,11 +195,19 @@ function Animations.play(
 	kind: Kind?,
 	fadeTime: number?,
 	speed: number?,
-	weight: number?
+	weight: number?,
+	priority: Enum.AnimationPriority?
 ): AnimationTrack?
-	local track = Animations.track(model, key, kind)
+	local track = Animations.track(model, key, kind, priority)
 	if not track then
 		return nil
+	end
+	if priority then
+		-- Belt and braces: the asset carries the priority, but an already-loaded
+		-- track only honours it if it is set here too.
+		pcall(function()
+			track.Priority = priority
+		end)
 	end
 
 	local ok = pcall(function()

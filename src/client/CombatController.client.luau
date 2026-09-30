@@ -4,12 +4,17 @@
 	-----------------------------
 	Everything the player *feels*:
 
-  * Keybinds   -- Left Click: slash, F: parry / guard, Q or Shift: dodge.
+  * Keybinds   -- rebindable, and owned by KeybindManager: Left Click: slash,
+                  F: parry / guard, Shift or Q: dodge.
   * Camera     -- mouse-look lock (no right-click hold) plus trauma shake, FOV
                   punches and swing roll, bound to render on top of the default
                   camera script. The cursor is freed for the perk overlay / menus.
-  * Animations -- authored R15/R6 slash clips via Humanoid.Animator when they are
-                  configured, with the procedural Motor6D swing as the fallback.
+  * Animations -- authored slash clips via Humanoid.Animator when they are
+                  configured, then Roblox's own stock sword clips, and otherwise a
+                  procedural frame override (CombatConfig.Procedural): each beat's
+                  joint offset is driven on RunService.PreSimulation -- after the
+                  Animator has run -- while the default idle/tool layers are held at
+                  zero weight, so an attack or parry always renders on screen.
 	  * Sword      -- poses every katana in the world from replicated CombatFx, so
 	                  the local player and every observer see the same cut.
 	  * Telegraphs -- draws the enemy windup ring above each enemy from attributes.
@@ -35,9 +40,9 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local CombatConfig = require(Shared:WaitForChild("CombatConfig"))
 local Remotes = require(Shared:WaitForChild("Remotes"))
 local Animations = require(Shared:WaitForChild("Animations"))
+local KeybindManager = require(Shared:WaitForChild("KeybindManager"))
 
 local ATTR = CombatConfig.Attributes
-local POSES = CombatConfig.Poses
 local FXCFG = CombatConfig.Fx
 local CAMERA_CFG = CombatConfig.Camera
 local LOCK_CFG = CAMERA_CFG.Lock
@@ -45,8 +50,34 @@ local TRAIL_CFG = CombatConfig.Trail
 local RIG = CombatConfig.RigParts
 local NAMES = Remotes.Names
 local TAG = CombatConfig.Tags.Enemy
+-- Procedural animation data: the pose each beat tweens onto the shoulder's rest C0
+-- (see CombatConfig.Procedural), read here so a swing and its authored-clip
+-- equivalent can never disagree.
+local PROCEDURAL = CombatConfig.Procedural
+local PARRY_BEAT = PROCEDURAL.Parry
+local POSE_FLIP = PROCEDURAL.Flip
 
 type Pose = { x: number, y: number, z: number }
+
+--[[
+	Joints the arm rig can drive.
+	A Motor6D carries its offset on C0; the newer AnimationConstraint joint that
+	the avatar joint upgrade swaps in carries the same information on Transform.
+	Every read and write below goes through jointOffset / setJointOffset, so a rig
+	of either generation can be posed.
+]]
+type JointKind = Motor6D | AnimationConstraint
+
+-- One in-flight interpolation: the frame driver walks `from` -> `to` over
+-- `duration` and re-asserts the result after the Animator has run.
+type JointDrive = {
+	from: CFrame,
+	to: CFrame,
+	startedAt: number,
+	duration: number,
+	style: Enum.EasingStyle,
+	direction: Enum.EasingDirection,
+}
 
 --[[
 	Structural mirror of Remotes.FxPayload.
@@ -77,6 +108,10 @@ local ACTIONS = {
 	Dodge = "CB_Dodge",
 }
 
+-- Verbose input trace, so a click can be followed in the Studio console from
+-- input to animation. Flip to false to silence it.
+local INPUT_DEBUG = true
+
 local attackRemote = Remotes.client(NAMES.Attack)
 local parryRemote = Remotes.client(NAMES.Parry)
 local dodgeRemote = Remotes.client(NAMES.Dodge)
@@ -94,6 +129,13 @@ local state = {
 	parryCooldownUntil = 0,
 	guarding = false,
 	parryHeld = false,
+	-- While `now()` is below this, the parry stance owns itself: its own timer eases
+	-- the blade home (0.1s later on a clash), so releasing the key early cannot cut
+	-- the block short.
+	parryStanceUntil = 0,
+	-- Bumped by every parry and every clash: a stale timer from an older stance must
+	-- never move the arm of a newer one.
+	parrySerial = 0,
 	airJumpsUsed = 0,
 	predictedSwings = 0,
 }
@@ -331,6 +373,65 @@ local function sparkBurst(position: Vector3, color: Color3, count: number, speed
 	Debris:AddItem(anchor, 1.2)
 end
 
+--[[
+	The mid-air jump's signature: a flat shockwave at the feet, a breath of upward
+	drift and a small outward scatter. Purely local -- the server never hears about
+	it -- and everything here dies on its own, so a chain of air jumps cannot pile
+	parts up in the workspace.
+]]
+local function airJumpPuff(root: BasePart)
+	-- The feet, not the root: a HumanoidRootPart floats about two studs up the body
+	-- on both R6 and R15, and a puff from the chest reads as a bug.
+	local position = root.Position - Vector3.new(0, 2, 0)
+
+	local disc = Instance.new("Part")
+	disc.Name = "CB_AirJumpRing"
+	-- A cylinder's axis runs along X, so this stands it up as a flat disc.
+	disc.Shape = Enum.PartType.Cylinder
+	disc.Size = Vector3.new(0.1, 3.2, 3.2)
+	disc.CFrame = CFrame.new(position) * CFrame.Angles(0, 0, math.rad(90))
+	disc.Material = Enum.Material.Neon
+	disc.Color = FXCFG.AirJumpColor
+	disc.Transparency = 0.25
+	disc.CanCollide = false
+	disc.CanQuery = false
+	disc.CanTouch = false
+	disc.Anchored = true
+	disc.CastShadow = false
+	disc.Parent = workspace
+
+	TweenService:Create(disc, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Size = Vector3.new(0.1, 6.2, 6.2),
+		Transparency = 1,
+	}):Play()
+	Debris:AddItem(disc, 0.5)
+
+	-- Drift rising off the kick: the one particle shape that says "pushed off"
+	-- rather than "hit", which keeps the jump from reading as an impact.
+	local drift = Instance.new("ParticleEmitter")
+	drift.Name = "CB_AirJumpDrift"
+	drift.Color = ColorSequence.new(FXCFG.AirJumpColor)
+	drift.Lifetime = NumberRange.new(0.25, 0.45)
+	drift.Speed = NumberRange.new(6, 13)
+	drift.SpreadAngle = Vector2.new(24, 24)
+	drift.Acceleration = Vector3.new(0, 14, 0)
+	drift.Rate = 0
+	drift.LightEmission = 0.8
+	drift.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.3),
+		NumberSequenceKeypoint.new(1, 0),
+	})
+	drift.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.15),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	drift.Parent = disc
+	drift:Emit(14)
+
+	-- Plus the outward sparks every other hit in the game already speaks.
+	sparkBurst(position, FXCFG.AirJumpColor, 10, 14)
+end
+
 -- ---------------------------------------------------------------------------
 -- Screen feedback (flash + damage vignette)
 -- ---------------------------------------------------------------------------
@@ -371,8 +472,8 @@ end
 
 type SwordRig = {
 	model: Model,
-	shoulder: Motor6D?,
-	baseC0: CFrame?,
+	shoulder: JointKind?,
+	baseOffset: CFrame?,
 	trail: Trail?,
 	-- White core ribbon inside the coloured one; created locally if the server's
 	-- blade replicated before the glow upgrade.
@@ -383,14 +484,30 @@ type SwordRig = {
 local GRIP_OFFSET = CFrame.new(0, 0.3, -0.1) * CFrame.Angles(math.rad(180), 0, 0)
 
 local swords: { [Model]: SwordRig } = {}
--- One list per character: a swing tweens several joints at once, and the next
--- swing has to cancel all of them, not just the last one created.
-local armTweens: { [Model]: { Tween } } = {}
 
-local function findJoint(character: Model, names: { string }): Motor6D?
+--[[
+	Joint offset accessors.
+	A Motor6D is posed through C0; an AnimationConstraint has no C0/C1 pair, only
+	its Transform, which is also the property the Animator writes. Both are read
+	and written through these two functions so every pose in this file works on a
+	rig of either generation.
+]]
+local function jointOffset(joint: JointKind): CFrame
+	return if joint:IsA("Motor6D") then joint.C0 else joint.Transform
+end
+
+local function setJointOffset(joint: JointKind, offset: CFrame)
+	if joint:IsA("Motor6D") then
+		joint.C0 = offset
+	else
+		joint.Transform = offset
+	end
+end
+
+local function findJoint(character: Model, names: { string }): JointKind?
 	for _, name in names do
 		for _, descendant in character:GetDescendants() do
-			if descendant:IsA("Motor6D") and descendant.Name == name then
+			if (descendant:IsA("Motor6D") or descendant:IsA("AnimationConstraint")) and descendant.Name == name then
 				return descendant
 			end
 		end
@@ -398,8 +515,57 @@ local function findJoint(character: Model, names: { string }): Motor6D?
 	return nil
 end
 
-local function findShoulder(character: Model): Motor6D?
-	return findJoint(character, RIG.ShoulderJointNames)
+--[[
+	getRightShoulder(character)
+	---------------------------
+	The joint that carries the sword arm, newest rig convention first:
+
+	  1. R15 / Rthro -- RightUpperArm.RightShoulder
+	  2. R6           -- Torso["Right Shoulder"]
+	  3. Any Motor6D or AnimationConstraint with "shoulder" in its name, for a
+	     custom or tool rig that names its joints its own way.
+
+	Returns nil on a rig with no shoulder at all; every caller treats that as
+	"nothing to pose" and keeps the blade-only feedback instead.
+]]
+local function getRightShoulder(character: Model): JointKind?
+	local rightUpperArm = character:FindFirstChild("RightUpperArm")
+	if rightUpperArm then
+		local joint = rightUpperArm:FindFirstChild("RightShoulder")
+		if joint and (joint:IsA("Motor6D") or joint:IsA("AnimationConstraint")) then
+			return joint
+		end
+	end
+
+	local torso = character:FindFirstChild("Torso")
+	if torso then
+		local joint = torso:FindFirstChild("Right Shoulder")
+		if joint and (joint:IsA("Motor6D") or joint:IsA("AnimationConstraint")) then
+			return joint
+		end
+	end
+
+	for _, name in RIG.ShoulderJointNames do
+		for _, descendant in character:GetDescendants() do
+			if (descendant:IsA("Motor6D") or descendant:IsA("AnimationConstraint")) and descendant.Name == name then
+				return descendant
+			end
+		end
+	end
+
+	for _, descendant in character:GetDescendants() do
+		if
+			(descendant:IsA("Motor6D") or descendant:IsA("AnimationConstraint"))
+			and string.find(string.lower(descendant.Name), "shoulder", 1, true)
+		then
+			return descendant
+		end
+	end
+	return nil
+end
+
+local function findShoulder(character: Model): JointKind?
+	return getRightShoulder(character)
 end
 
 --[[
@@ -410,34 +576,83 @@ end
 	still swings. Joints resolve lazily, and each keeps the rest C0 captured at
 	resolve time, so repeated poses can never drift away from the idle stance.
 ]]
+--[[
+	A joint paired with the rest offset it was born with.
+	Every pose is written to the joint's own offset -- C0 on a Motor6D, Transform on
+	an AnimationConstraint -- never to `Motor6D.Transform` on a Motor6D: the default
+	`Animate` script and every playing track own that property and rewrite it each
+	frame, so a script pose written there never survives to render.
+]]
+type PoseJoint = {
+	joint: JointKind,
+	-- Captured once, when the rig is first resolved; poses multiply onto it and can
+	-- therefore never drift away from the idle stance.
+	rest: CFrame,
+}
+
 type ArmRig = {
-    shoulder: Motor6D?,
-    elbow: Motor6D?,
-    waist: Motor6D?,
-    wrist: Motor6D?,    
+	shoulder: PoseJoint?,
+	elbow: PoseJoint?,
+	waist: PoseJoint?,
+	wrist: PoseJoint?,
 }
 
 local armRigs: { [Model]: ArmRig } = {}
 
+--[[
+	Active arm override state, all per character.
+
+	  armHolds      -- the joint offset this system last wrote. Re-asserted after
+	                   the Animator every frame for as long as an action owns the
+	                   rig, so a pose can never be half-overwritten by an idle or
+	                   a locomotion track.
+	  armDrives     -- joints currently interpolating towards a beat.
+	  armSuppressed -- idle/tool tracks, with the weight to hand back when the
+	                   action ends.
+	  armOverride   -- which action owns the rig, and when the override expires
+	                   (a safety net; normal paths end explicitly).
+]]
+local armHolds: { [Model]: { [JointKind]: CFrame } } = {}
+local armDrives: { [Model]: { [JointKind]: JointDrive } } = {}
+local armSuppressed: { [Model]: { [AnimationTrack]: number } } = {}
+local armOverride: { [Model]: { serial: number, expiresAt: number } } = {}
+
+--[[
+	Track names that fight a script pose.
+	The default `Animate` script keeps an idle (and a tool grip) playing under an
+	attack, and those tracks write the very same joints -- the arm ends up halfway
+	between the two poses. Their weight is held at zero for the duration of an
+	action instead. Add "walk"/"run" here if a swing is ever read mid-stride.
+]]
+local SUPPRESSED_TRACK_PARTS = { "idle", "tool" }
+
+-- Captures a joint's rest offset (nil-safe, so a rig without an elbow is fine).
+local function poseJoint(joint: JointKind?): PoseJoint?
+	if not joint then
+		return nil
+	end
+	return { joint = joint, rest = jointOffset(joint) }
+end
+
 local function getArmRig(character: Model): ArmRig?
 	local cached = armRigs[character]
-	if cached and cached.shoulder and cached.shoulder.Parent then
-		return cached
+	if cached then
+		local held = cached.shoulder
+		if held and held.joint.Parent then
+			return cached
+		end
 	end
 
 	local shoulder = findShoulder(character)
 	if not shoulder then
 		return nil
 	end
-	local elbow = findJoint(character, RIG.ElbowJointNames)
-	local waist = findJoint(character, RIG.WaistJointNames)
-	local wrist = findJoint(character, RIG.WristJointNames)
 
 	local rig: ArmRig = {
-		shoulder = shoulder,
-		elbow = elbow,
-		waist = waist,
-		wrist = wrist,
+		shoulder = poseJoint(shoulder),
+		elbow = poseJoint(findJoint(character, RIG.ElbowJointNames)),
+		waist = poseJoint(findJoint(character, RIG.WaistJointNames)),
+		wrist = poseJoint(findJoint(character, RIG.WristJointNames)),
 	}
 	armRigs[character] = rig
 	return rig
@@ -526,7 +741,7 @@ end
 ]]
 local function getSword(character: Model): SwordRig?
 	local cached = swords[character]
-	if cached and cached.model.Parent == character and cached.shoulder and cached.baseC0 then
+	if cached and cached.model.Parent == character and cached.shoulder and cached.baseOffset then
 		return cached
 	end
 
@@ -547,82 +762,153 @@ local function getSword(character: Model): SwordRig?
 	local rig: SwordRig = {
 		model = model,
 		shoulder = shoulder,
-		baseC0 = if shoulder then shoulder.C0 else nil,
+		baseOffset = if shoulder then jointOffset(shoulder) else nil,
 		trail = primary,
 		coreTrail = core,
 	}
-	if shoulder and rig.baseC0 then
+	if shoulder and rig.baseOffset then
 		swords[character] = rig
 	end
 	return rig
 end
 
 local function poseCFrame(pose: Pose, alpha: number): CFrame
-	return CFrame.Angles(math.rad(pose.x * alpha), math.rad(pose.y * alpha), math.rad(pose.z * alpha))
+	-- `POSE_FLIP` is the one-line mirror fix for a rig whose shoulder axes run the
+	-- other way; it is 1/1/1 unless a rig needed flipping.
+	return CFrame.Angles(
+		math.rad(pose.x * alpha * POSE_FLIP.x),
+		math.rad(pose.y * alpha * POSE_FLIP.y),
+		math.rad(pose.z * alpha * POSE_FLIP.z)
+	)
 end
 
 local REST_POSE: Pose = { x = 0, y = 0, z = 0 }
 local SWING_RIG = CombatConfig.SwingRig
 
-type JointTarget = { joint: Motor6D, goal: CFrame }
+type JointTarget = { joint: JointKind, goal: CFrame }
 
 --[[
 	Joint targets for one beat of a swing.
-	The shoulder angles come from the shared pose tables, which carry no forearm or
-torso information; the fold and the turn are added here from CombatConfig.SwingRig
-	so a clip-less swing reads as a cut instead of one stiff bone. Rigs without those
-	joints simply produce fewer targets.
+	The shoulder takes the beat's pose (already in the shoulder's own frame); the
+	forearm fold, wrist snap and torso turn come from CombatConfig.SwingRig, because
+	the pose tables carry no forearm or torso information -- without them a clip-less
+	swing reads as one stiff bone. Rigs without those joints simply produce fewer
+	targets. Every goal is `rest * offset`, so a pose is always relative to the rig's
+	own rest stance and can never accumulate drift.
 ]]
 local function swingBeat(rig: ArmRig, pose: Pose, phase: string, alternate: boolean): { JointTarget }
 	local targets: { JointTarget } = {}
 
 	-- Shoulder
-	if rig.shoulder then
-		table.insert(targets, { joint = rig.shoulder, goal = poseCFrame(pose, 1) })
+	local shoulder = rig.shoulder
+	if shoulder then
+		table.insert(targets, { joint = shoulder.joint, goal = shoulder.rest * poseCFrame(pose, 1) })
 	end
 
 	-- Elbow
-	if rig.elbow then
+	local elbow = rig.elbow
+	if elbow then
 		local fold = if phase == "Windup"
 			then SWING_RIG.ElbowFold
 			elseif phase == "Impact" then SWING_RIG.ElbowExtend
 			elseif phase == "Guard" then SWING_RIG.ElbowGuard
 			else 0
 		if alternate then fold *= 0.75 end
-		table.insert(targets, { joint = rig.elbow, goal = CFrame.Angles(math.rad(fold), 0, 0) })
+		table.insert(targets, { joint = elbow.joint, goal = elbow.rest * CFrame.Angles(math.rad(fold), 0, 0) })
 	end
 
 	-- Wrist
-	if rig.wrist then
+	local wrist = rig.wrist
+	if wrist then
 		local flick = if phase == "Windup"
 			then SWING_RIG.WristFlick
 			elseif phase == "Impact" then SWING_RIG.WristSnap
 			else 0
 		if alternate then flick *= -1 end
-		table.insert(targets, { joint = rig.wrist, goal = CFrame.Angles(math.rad(flick), 0, 0) })
+		table.insert(targets, { joint = wrist.joint, goal = wrist.rest * CFrame.Angles(math.rad(flick), 0, 0) })
 	end
 
 	-- Waist
-	if rig.waist then
+	local waist = rig.waist
+	if waist then
 		local turn = if phase == "Windup"
 			then SWING_RIG.WaistBack
 			elseif phase == "Impact" then SWING_RIG.WaistThrough
 			else 0
 		if alternate then turn *= -1 end
-		table.insert(targets, { joint = rig.waist, goal = CFrame.Angles(0, math.rad(turn), 0) })
+		table.insert(targets, { joint = waist.joint, goal = waist.rest * CFrame.Angles(0, math.rad(turn), 0) })
 	end
 
 	return targets
 end
 
--- Snaps a beat into place. The impact frame must never be tweened through.
-local function applyArmTargets(targets: { JointTarget })
+--[[
+	Snaps a beat into place and parks the frame override on it.
+	The impact frame must never be interpolated through, so a snap also cancels the
+	joint's drive. The hold is what makes the snap stick: it is re-asserted after
+	the Animator every frame for as long as an action owns the rig.
+]]
+local function applyArmTargets(character: Model, targets: { JointTarget })
+	local holds = armHolds[character]
+	if not holds then
+		holds = {}
+		armHolds[character] = holds
+	end
+	local drives = armDrives[character]
 	for _, target in targets do
-		target.joint.Transform = target.goal -- Changed from C0 to Transform!
+		if drives then
+			drives[target.joint] = nil
+		end
+		holds[target.joint] = target.goal
+		setJointOffset(target.joint, target.goal)
 	end
 end
 
--- Tweened beat; throws nothing, so a rig without an elbow still swings.
+--[[
+	Starts a joint drive: the frame loop walks the joint from wherever it is now to
+	`goal` over `duration`, and the joint's hold follows the interpolated value so
+	the same pose can be re-asserted after the Animator runs. Interpolation lives
+	here rather than in TweenService because a tween's write has no defined order
+	against the animation step; this has.
+]]
+local function driveJoint(
+	character: Model,
+	joint: JointKind,
+	goal: CFrame,
+	duration: number,
+	style: Enum.EasingStyle,
+	direction: Enum.EasingDirection
+)
+	local holds = armHolds[character]
+	if not holds then
+		holds = {}
+		armHolds[character] = holds
+	end
+	holds[joint] = goal
+
+	local drives = armDrives[character]
+	if duration <= 0.01 then
+		if drives then
+			drives[joint] = nil
+		end
+		setJointOffset(joint, goal)
+		return
+	end
+	if not drives then
+		drives = {}
+		armDrives[character] = drives
+	end
+	drives[joint] = {
+		from = jointOffset(joint),
+		to = goal,
+		startedAt = now(),
+		duration = duration,
+		style = style,
+		direction = direction,
+	}
+end
+
+-- Animated beat; throws nothing, so a rig without an elbow still swings.
 local function tweenArmTargets(
 	character: Model,
 	targets: { JointTarget },
@@ -630,19 +916,8 @@ local function tweenArmTargets(
 	style: Enum.EasingStyle,
 	direction: Enum.EasingDirection
 )
-	local tweens = armTweens[character]
-	if not tweens then
-		tweens = {}
-		armTweens[character] = tweens
-	end
 	for _, target in targets do
-		local tween = TweenService:Create(
-			target.joint,
-			TweenInfo.new(math.max(duration, 0.01), style, direction),
-			{ Transform = target.goal } -- Changed from C0 to Transform!
-		)
-		table.insert(tweens, tween)
-		tween:Play()
+		driveJoint(character, target.joint, target.goal, duration, style, direction)
 	end
 end
 
@@ -674,25 +949,209 @@ local function setTrailEnabled(rig: SwordRig, enabled: boolean, duration: number
 	end
 end
 
--- Cancels whatever arm tween is mid-flight for a character.
+-- Drops every in-flight drive for a character. The joints stay where they are:
+-- the next beat drives from the live pose, exactly like a cancelled Tween did.
 local function cancelArmTween(character: Model)
-	local tweens = armTweens[character]
-	if not tweens then
-		return
-	end
-	for _, tween in tweens do
-		tween:Cancel()
-	end
-	armTweens[character] = nil
+	armDrives[character] = nil
 end
 
-local function ensureBladeAttachment(blade: BasePart, name: string, y: number): Attachment
-	local found = blade:FindFirstChild(name)
-	if found and found:IsA("Attachment") then
-		return found
+--[[
+	Hands the default rig layers their weight back.
+	Called from the end of every action, and from the frame loop when an override
+	runs past its safety window without one.
+]]
+local function endArmOverride(character: Model, serial: number?)
+	local current = armOverride[character]
+	if serial ~= nil and (not current or current.serial ~= serial) then
+		return
+	end
+	armOverride[character] = nil
+	armDrives[character] = nil
+	armHolds[character] = nil
+
+	local saved = armSuppressed[character]
+	if not saved then
+		return
+	end
+	armSuppressed[character] = nil
+	for track, weight in saved do
+		pcall(function()
+			if track.IsPlaying then
+				track:AdjustWeight(weight, 0)
+			end
+		end)
+	end
+end
+
+--[[
+	Weights the default rig layers out of the way.
+	The `Animate` script keeps its idle (and its tool grip) playing under an attack,
+	and those tracks write the same joints a pose does -- so the arm ends up halfway
+	between the two. Zeroing their weight leaves the procedural pose (or an Action4
+	clip) as the only thing driving the arm, and the weight each track had is kept
+	so resuming hands back exactly what the rig was doing.
+]]
+local function suppressIdleTracks(character: Model)
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
+	if not animator then
+		return
+	end
+
+	local saved = armSuppressed[character]
+	if not saved then
+		saved = {}
+		armSuppressed[character] = saved
+	end
+
+	for _, track in animator:GetPlayingAnimationTracks() do
+		local name = string.lower(track.Name)
+		local fights = false
+		for _, part in SUPPRESSED_TRACK_PARTS do
+			if string.find(name, part, 1, true) then
+				fights = true
+				break
+			end
+		end
+		if fights then
+			if saved[track] == nil then
+				-- `WeightCurrent`, not `Weight`: an AnimationTrack has no `Weight` member, and
+				-- reading it here would throw outside the pcall below and abort the override.
+				saved[track] = track.WeightCurrent
+			end
+			if track.WeightCurrent > 0 then
+				pcall(function()
+					track:AdjustWeight(0, 0)
+				end)
+			end
+		end
+	end
+end
+
+--[[
+	Starts an override and returns the serial that owns it.
+	`lifetime` bounds an override that may outlive its own callbacks -- a safety net
+	for an interrupted action, not the normal exit; nil means it runs until something
+	ends it (a guard stance is held for as long as the key is down). Deferred
+	callbacks pass the serial back to `endArmOverride`, so a stale timer can never
+	steal the arm from a newer action.
+]]
+local function beginArmOverride(character: Model, lifetime: number?): number
+	local current = armOverride[character]
+	local serial = if current then current.serial + 1 else 1
+	armOverride[character] = {
+		serial = serial,
+		expiresAt = if lifetime then now() + lifetime else math.huge,
+	}
+	suppressIdleTracks(character)
+	return serial
+end
+
+-- The serial that currently owns a character's arm, if any.
+local function armOverrideToken(character: Model): number?
+	local current = armOverride[character]
+	return if current then current.serial else nil
+end
+
+--[[
+	Easing curves the beats use, evaluated per frame by the driver.
+	Quad and Quart are the only styles the pose tables ask for; anything else falls
+	back to a cubic out, close enough that a beat can be retimed without touching
+	this table.
+]]
+local function easeAlpha(style: Enum.EasingStyle, direction: Enum.EasingDirection, alpha: number): number
+	local t = math.clamp(alpha, 0, 1)
+	if direction == Enum.EasingDirection.InOut then
+		if t < 0.5 then
+			return 0.5 * easeAlpha(style, Enum.EasingDirection.In, t * 2)
+		end
+		return 0.5 + 0.5 * easeAlpha(style, Enum.EasingDirection.Out, (t - 0.5) * 2)
+	end
+	local x = if direction == Enum.EasingDirection.In then t else 1 - t
+	local eased = if style == Enum.EasingStyle.Linear
+		then x
+		elseif style == Enum.EasingStyle.Quart then x * x * x * x
+		else x * x
+	return if direction == Enum.EasingDirection.In then eased else 1 - eased
+end
+
+--[[
+	The frame override itself.
+	PreSimulation runs after the Animator has evaluated the frame and before that
+	frame is simulated and drawn, which is the one window where a script-written
+	joint offset is guaranteed to be the last word on the frame. Every held joint is
+	re-asserted here for as long as an action owns the rig, and a beat's walk towards
+	its goal is computed here too, so nothing can land on the wrong side of the
+	Animator.
+]]
+RunService.PreSimulation:Connect(function()
+	local timestamp = now()
+	for character, holds in armHolds do
+		local drives = armDrives[character]
+		for joint, hold in holds do
+			if joint.Parent then
+				local drive = drives and drives[joint]
+				if drive then
+					local alpha = math.clamp((timestamp - drive.startedAt) / drive.duration, 0, 1)
+					hold = drive.from:Lerp(drive.to, easeAlpha(drive.style, drive.direction, alpha))
+					holds[joint] = hold
+					if alpha >= 1 then
+						drives[joint] = nil
+					end
+				end
+				setJointOffset(joint, hold)
+			end
+		end
+
+		local claim = armOverride[character]
+		if claim then
+			suppressIdleTracks(character)
+			if timestamp >= claim.expiresAt then
+				endArmOverride(character, claim.serial)
+			end
+		end
+	end
+end)
+
+--[[
+	Snaps every joint of a character's rig back onto its captured rest offset.
+	Used where an authored clip takes over the arms (the clip owns the rotation, so a
+	leftover procedural pose must not stack under it) and when a body dies, because
+	the rig is cached per character and a stale pose would otherwise outlive the swing
+	that wrote it. The rest offset becomes the held pose, so the override keeps
+	re-asserting it while the clip plays.
+]]
+local function restoreArmPose(character: Model)
+	cancelArmTween(character)
+	local rig = armRigs[character]
+	if not rig then
+		return
+	end
+	local slots: { PoseJoint? } = { rig.shoulder, rig.elbow, rig.waist, rig.wrist }
+	local targets: { JointTarget } = {}
+	for _, slot in slots do
+		if slot then
+			table.insert(targets, { joint = slot.joint, goal = slot.rest })
+		end
+	end
+	applyArmTargets(character, targets)
+end
+
+--[[
+	Resolves a blade endpoint for the arc Beam, current name first.
+	The server owns the katana, but the arc is pure presentation: a blade built by
+	an older revision carries the legacy names, and both are accepted so no second
+	attachment is ever minted next to a live one.
+]]
+local function ensureBladeAttachment(blade: BasePart, names: { string }, y: number): Attachment
+	for _, name in names do
+		local found = blade:FindFirstChild(name)
+		if found and found:IsA("Attachment") then
+			return found
+		end
 	end
 	local created = Instance.new("Attachment")
-	created.Name = name
+	created.Name = names[1]
 	created.Position = Vector3.new(0, y, 0)
 	created.Parent = blade
 	return created
@@ -714,8 +1173,8 @@ local function spawnSlashArc(character: Model, color: Color3?)
 	end
 	local blade = bladeInstance :: BasePart
 
-	local hilt = ensureBladeAttachment(blade, "Hilt", -1.65)
-	local tip = ensureBladeAttachment(blade, "Tip", 1.65)
+	local hilt = ensureBladeAttachment(blade, RIG.HiltAttachmentNames, -1.65)
+	local tip = ensureBladeAttachment(blade, RIG.TipAttachmentNames, 1.65)
 
 	local beam = Instance.new("Beam")
 	beam.Name = "CB_SlashArc"
@@ -735,14 +1194,14 @@ local function spawnSlashArc(character: Model, color: Color3?)
 end
 
 --[[
-	One swing, three beats: windup -> impact -> recovery.
+	One swing, beats written to C0: out -> hold -> back (see CombatConfig.Procedural).
 
-	An authored clip (see CombatConfig.Animations + the shared Animations module)
-	drives the arms when one is configured. Otherwise the swing is built from the rig
-	itself: shoulder rotation from the shared poses plus the forearm fold and torso
-turn from CombatConfig.SwingRig, so the attack reads as a cut rather than one stiff
-	bone. Works on R6 (shoulder only) and R15 (shoulder + elbow + waist). The blade's
-	ribbons and arc fire on the impact beat either way.
+	An authored clip (CombatConfig.Animations + the shared Animations module) drives
+	the arms when one is configured. Otherwise the swing is procedural: the shoulder
+	takes the beat's pose, the forearm folds and drives from CombatConfig.SwingRig, and
+	the torso turns away then through it. Works on R6 (shoulder only) and R15 (shoulder
+	+ elbow + wrist + waist). The blade's ribbons and arc fire on the beat the hitbox
+	resolves either way.
 ]]
 local function playSwing(character: Model, stepIndex: number, attackSpeed: number, color: Color3?)
 	local serial = (trailSerial[character] or 0) + 1
@@ -758,115 +1217,258 @@ local function playSwing(character: Model, stepIndex: number, attackSpeed: numbe
 		sword.trail.Color = ColorSequence.new(color)
 	end
 
-	-- Ribbon + arc, fired on the beat the blade would connect.
-	local function impactBlade()
+	--[[
+		The blade's ribbons belong to the cut, not to the stance: switched on as the
+		blade starts travelling and off again the moment the arm eases home, so an
+		idle sword is always dark. `serial` keeps a newer cut authoritative over an
+		older one's delayed switch-off.
+	]]
+	local function ribbon(enabled: boolean, duration: number?)
 		if sword then
-			setTrailEnabled(sword, true, math.min(0.16, recovery), serial)
+			setTrailEnabled(sword, enabled, duration, serial)
 		end
+	end
+
+	-- Ribbon + arc, fired on the beat the blade would connect. The finisher's camera
+	-- kick rides this beat too: it belongs on the slam, not on the click.
+	local function impactBlade()
+		ribbon(true, math.min(0.16, recovery))
 		spawnSlashArc(character, color)
+		if step.kind == "Heavy" and character == player.Character then
+			addFov(step.fovKick * 0.7)
+			addRoll(-3.5)
+		end
 	end
 
 	-- A held guard stance yields the instant a swing starts.
 	Animations.stop(character, "Guard", 0.08)
 
-	-- 1. Authored clip: it owns the arms, so no tween may run beside it.
+	--[[
+		The whole action owns the rig from here: the default idle/tool layers are
+		weighted out, and the safety window outlives the beat timeline so even an
+		interrupted swing hands the rig back on its own.
+	]]
+	local overrideToken = beginArmOverride(character, windup + recovery + 0.75)
+
+	--[[
+		1. A clip owns the arms when one resolves: the authored clip first, then
+		Roblox's own stock sword slash, which requires no asset ownership and loads
+		for every account. Both play at Action4 -- above every layer the default
+		`Animate` script uses -- so the swing takes over idle and locomotion rather
+		than blending with them. `restoreArmPose` drops any procedural pose left on
+		the shoulder, or the two rotations would stack.
+	]]
 	local clipKey = if step.kind == "Heavy"
 		then "Heavy"
 		elseif stepIndex % 2 == 0 then "Slash2"
 		else "Slash1"
-	local track = Animations.play(character, clipKey, "Player", 0.06, math.clamp(speed, 0.4, 3), 1)
+	local stockKey = if step.kind == "Heavy" then "StockHeavy" else "StockSlash"
+	local clipSpeed = math.clamp(speed, 0.4, 3)
+	local track = Animations.play(character, clipKey, "Player", 0.08, clipSpeed, 1, Enum.AnimationPriority.Action4)
+	local playingKey = clipKey
+	if not track then
+		track = Animations.play(character, stockKey, "Stock", 0.08, clipSpeed, 1, Enum.AnimationPriority.Action4)
+		playingKey = stockKey
+	end
 	if track then
-		cancelArmTween(character)
+		restoreArmPose(character)
 		task.delay(windup, function()
 			if trailSerial[character] == serial then
 				impactBlade()
 			end
 		end)
 		task.delay(windup + recovery, function()
-			Animations.stop(character, clipKey, 0.16)
+			Animations.stop(character, playingKey, 0.16)
+			endArmOverride(character, overrideToken)
 		end)
 		return
 	end
 
-	-- 2. Procedural fallback: a dead asset id, an R6 rig with no R6 clip, or simply
-	-- no clips authored yet. Shoulder + forearm + torso, so the attack reads.
+	-- 2. Procedural fallback: no clip authored or loadable at all. Shoulder +
+	-- forearm + torso beats, held on each joint's own offset and re-asserted after
+	-- the Animator every frame, so the default Animate script cannot overwrite the
+	-- pose on the frame it is written.
 	local armRig = getArmRig(character)
 	if not armRig then
 		-- No posable joints at all: still flash a blade arc so the cut reads.
 		spawnSlashArc(character, color)
+		endArmOverride(character, overrideToken)
 		return
 	end
 
+	local beat = PROCEDURAL.Combo[stepIndex] or PROCEDURAL.Combo[1]
 	local alternate = step.kind ~= "Heavy" and stepIndex % 2 == 0
-	local windupPose: Pose = if step.kind == "Heavy"
-		then POSES.HeavyWindup
-		elseif alternate then POSES.SlashAlternate
-		else POSES.SlashWindup
-	local impactPose: Pose = if step.kind == "Heavy" then POSES.HeavyImpact else POSES.SlashImpact
+	local outTime = math.max(beat.out / speed, 0.02)
+	local holdTime = math.max(beat.hold / speed, 0.01)
+	local backTime = math.max(beat.back / speed, 0.05)
+	local heavy = step.kind == "Heavy"
+
+	-- Ribbon off, arm home, rest pose snapped once the tween lands.
+	local function easeHome()
+		ribbon(false)
+		tweenArmTargets(
+			character,
+			swingBeat(armRig, REST_POSE, "Rest", false),
+			backTime,
+			Enum.EasingStyle.Quart,
+			Enum.EasingDirection.Out
+		)
+		task.delay(backTime + 0.02, function()
+			if trailSerial[character] == serial then
+				applyArmTargets(character, swingBeat(armRig, REST_POSE, "Rest", false))
+				endArmOverride(character, overrideToken)
+			end
+		end)
+	end
 
 	cancelArmTween(character)
+
+	if not heavy then
+		--[[
+			Light slash: accelerate into the cut pose, park it through the impact (so
+			the blade is inside the target when the hitbox resolves), then ease home.
+			The pose is the cut: the impact beat only re-aims the forearm, wrist and
+			torso, never the shoulder, so the blade never jumps mid-swing.
+		]]
+		local impactAt = math.max(windup, outTime)
+		local holdEnds = math.max(outTime + holdTime, impactAt)
+
+		ribbon(true, holdEnds + 0.06)
+		tweenArmTargets(
+			character,
+			swingBeat(armRig, beat.pose, "Windup", alternate),
+			outTime,
+			Enum.EasingStyle.Quad,
+			Enum.EasingDirection.Out
+		)
+
+		task.delay(impactAt, function()
+			if trailSerial[character] ~= serial then
+				return
+			end
+			cancelArmTween(character)
+			applyArmTargets(character, swingBeat(armRig, beat.pose, "Impact", alternate))
+			impactBlade()
+		end)
+
+		task.delay(holdEnds, function()
+			if trailSerial[character] ~= serial then
+				return
+			end
+			cancelArmTween(character)
+			easeHome()
+		end)
+		return
+	end
+
+	--[[
+		Heavy finisher: raise the blade overhead, hold the top of the arc for the
+		wind-up pause, then slam. The slam is scheduled to land on the server's windup
+		-- 0.06s of travel, punch and all -- and never before the raise is up.
+	]]
+	local raisePose: Pose = beat.raise or beat.pose
+	local slamTime = math.max((beat.slam or 0.06) / speed, 0.02)
+	local slamStarts = math.max(outTime + holdTime, windup - slamTime)
+	local slamEnds = slamStarts + slamTime
+
 	tweenArmTargets(
 		character,
-		swingBeat(armRig, windupPose, "Windup", alternate),
-		windup,
+		swingBeat(armRig, raisePose, "Windup", false),
+		outTime,
 		Enum.EasingStyle.Quad,
 		Enum.EasingDirection.Out
 	)
 
-	task.delay(windup, function()
+	task.delay(slamStarts, function()
 		if trailSerial[character] ~= serial then
 			return
 		end
-
-		-- Snap through the cut, then ease home; the ribbon and arc fire on this beat.
-		applyArmTargets(swingBeat(armRig, impactPose, "Impact", alternate))
-		impactBlade()
+		ribbon(true, slamTime + 0.14)
+		cancelArmTween(character)
 		tweenArmTargets(
 			character,
-			swingBeat(armRig, REST_POSE, "Rest", false),
-			recovery,
+			swingBeat(armRig, beat.pose, "Impact", false),
+			slamTime,
 			Enum.EasingStyle.Quart,
-			Enum.EasingDirection.Out
+			Enum.EasingDirection.In
 		)
-		task.delay(recovery, function()
-			if trailSerial[character] == serial then
-				applyArmTargets(swingBeat(armRig, REST_POSE, "Rest", false))
-			end
-		end)
+	end)
+
+	task.delay(slamEnds, function()
+		if trailSerial[character] ~= serial then
+			return
+		end
+		cancelArmTween(character)
+		applyArmTargets(character, swingBeat(armRig, beat.pose, "Impact", false))
+		impactBlade()
+		easeHome()
 	end)
 end
 
 --[[
-	Guard / riposte poses for the local player, driven by input feel.
-	A *held* guard can use an authored looping clip ("Guard"); the riposte flourish
-	stays procedural because it is a one-shot beat with its own pose data.
+	Parry / guard stance, driven by input feel.
+	A configured "Guard" clip owns the arms when one exists -- a procedural pose
+	must not run beside it, or the two fight over the same joints. Otherwise the
+	stance is driven in over `duration`: 0.05s for a parry, because the window is
+	only 0.2s long and the blade has to be up before it opens.
 ]]
-local function holdGuardPose(pose: Pose)
-	local character = player.Character
-	if not character then
+local function poseGuard(character: Model, pose: Pose, duration: number)
+	-- No expiry: a guard lasts as long as the key is held, and the settle that
+	-- ends the stance is what ends the override.
+	beginArmOverride(character, nil)
+
+	local track = Animations.play(character, "Guard", "Player", 0.12, 1, 1, Enum.AnimationPriority.Action4)
+	if track then
+		restoreArmPose(character)
 		return
 	end
 
-	local isRiposte = pose == POSES.ParryRiposte
-	local isRest = pose.x == 0 and pose.y == 0 and pose.z == 0
-
-	if not isRiposte and not isRest then
-		local track = Animations.play(character, "Guard", "Player", 0.12, 1, 1)
-		if track then
-			return
-		end
-	end
-	if isRest then
-		Animations.stop(character, "Guard", 0.15)
-	end
-
 	local rig = getArmRig(character)
-	if rig then
-		-- Guarding always wins over an in-flight swing tween.
-		cancelArmTween(character)
-		local phase = if isRiposte then "Impact" elseif isRest then "Rest" else "Guard"
-		applyArmTargets(swingBeat(rig, pose, phase, false))
+	if not rig then
+		return
 	end
+	-- The stance always wins over an in-flight swing tween.
+	cancelArmTween(character)
+	tweenArmTargets(
+		character,
+		swingBeat(rig, pose, "Guard", false),
+		duration,
+		Enum.EasingStyle.Quad,
+		Enum.EasingDirection.Out
+	)
+end
+
+--[[
+	Eases the sword arm home and ends the stance's ownership of the rig.
+	`duration` is the settle time -- the parry spec calls for 0.15s, a swing uses its
+	own recovery -- and the rest pose is snapped at the end, so an interrupted drive
+	can never leave the shoulder fractionally off its rest offset.
+]]
+local function settleToRest(character: Model, duration: number)
+	-- Captured now: if a newer action claims the rig before this settle lands, the
+	-- deferred end below is discarded instead of stealing that action's arm.
+	local token = armOverrideToken(character)
+	local rig = getArmRig(character)
+	if not rig then
+		endArmOverride(character, token)
+		return
+	end
+	Animations.stop(character, "Guard", 0.15)
+	cancelArmTween(character)
+	tweenArmTargets(
+		character,
+		swingBeat(rig, REST_POSE, "Rest", false),
+		duration,
+		Enum.EasingStyle.Quart,
+		Enum.EasingDirection.Out
+	)
+	task.delay(math.max(duration, 0.01) + 0.02, function()
+		local live = armRigs[character]
+		if live and live.shoulder and live.shoulder.joint.Parent then
+			applyArmTargets(character, swingBeat(live, REST_POSE, "Rest", false))
+		end
+		endArmOverride(character, token)
+	end)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1125,16 +1727,25 @@ end
 
 local function submitAttack()
 	if player:GetAttribute(ATTR.ChoiceOpen) == true then
+		if INPUT_DEBUG then
+			print("[CombatController][Input] attack refused: perk overlay is open")
+		end
 		return
 	end
 
 	local character, humanoid, root = myCharacter()
 	if not character or not humanoid or not root then
+		if INPUT_DEBUG then
+			print("[CombatController][Input] attack refused: no live character")
+		end
 		return
 	end
 
 	local timestamp = now()
 	if timestamp < state.attackLockUntil then
+		if INPUT_DEBUG then
+			print("[CombatController][Input] attack refused: still recovering")
+		end
 		return
 	end
 
@@ -1155,16 +1766,30 @@ local function submitAttack()
 	state.comboExpiresAt = state.attackLockUntil + CombatConfig.Timings.ComboTimeout
 
 	state.guarding = false
+	-- A swing takes the arm over from any parry stance still holding it: without this
+	-- the stance's window timer would cancel the cut and drag the blade home mid-swing.
+	state.parrySerial += 1
+	state.parryStanceUntil = 0
 	-- Bounded: a rejected request must never leave the counter stuck above zero.
 	state.predictedSwings = math.min(state.predictedSwings + 1, 3)
+
+	if INPUT_DEBUG then
+		print(`[CombatController][Input] [LMB] slash {stepIndex} "{step.name}" ({step.kind}) at speed {string.format("%.2f", speed)}`)
+	end
 
 	-- Predict the swing locally so the blade moves on the same frame as the click.
 	playSwing(character, stepIndex, speed)
 	swingLunge(stepIndex)
 	playOneShot(step.swingSound, 0.5, 1, root)
 	addTrauma(step.shake * 0.55)
-	addFov(step.fovKick * 0.7)
-	addRoll(if step.kind == "Heavy" then -3.5 else -1.5)
+	if step.kind == "Heavy" then
+		-- The finisher's FOV punch belongs to the slam, not to the click: playSwing
+		-- fires it with the impact pose (see impactBlade).
+		addRoll(-3.5)
+	else
+		addFov(step.fovKick * 0.7)
+		addRoll(-1.5)
+	end
 
 	attackRemote:FireServer(stepIndex)
 
@@ -1172,7 +1797,9 @@ local function submitAttack()
 	-- when the blade actually connects.
 	task.delay(windup, function()
 		addTrauma(step.shake * 0.5)
-		addFov(step.fovKick * 0.5)
+		if step.kind ~= "Heavy" then
+			addFov(step.fovKick * 0.5)
+		end
 		addRoll(if step.kind == "Heavy" then -2.5 else -1)
 		playOneShot(step.hitSound, 0.3, if step.kind == "Heavy" then 0.85 else 1.15, root)
 	end)
@@ -1180,16 +1807,31 @@ end
 
 local function submitParry()
 	if player:GetAttribute(ATTR.ChoiceOpen) == true then
+		if INPUT_DEBUG then
+			print("[CombatController][Input] parry refused: perk overlay is open")
+		end
 		return
 	end
 
-	local _, humanoid, root = myCharacter()
+	local character, humanoid, root = myCharacter()
 	if not humanoid or not root then
+		if INPUT_DEBUG then
+			print("[CombatController][Input] parry refused: no live character")
+		end
 		return
 	end
 
 	local timestamp = now()
-	if timestamp < state.parryCooldownUntil or timestamp < state.attackLockUntil then
+	if timestamp < state.parryCooldownUntil then
+		if INPUT_DEBUG then
+			print("[CombatController][Input] parry refused: on cooldown")
+		end
+		return
+	end
+	if timestamp < state.attackLockUntil then
+		if INPUT_DEBUG then
+			print("[CombatController][Input] parry refused: mid-swing")
+		end
 		return
 	end
 
@@ -1199,24 +1841,43 @@ local function submitParry()
 	player:SetAttribute(ATTR.ParryReadyAt, state.parryCooldownUntil)
 	state.guarding = false
 
-	holdGuardPose(POSES.ParryGuard)
+	--[[
+		The stance: tweened in fast (0.05s), held for the whole window, then either
+		extended by a clash or eased home over 0.15s. `parrySerial` is what keeps the
+		window's timer and a clash's timer mutually exclusive.
+	]]
+	state.parryStanceUntil = timestamp + math.max(window, PARRY_BEAT.out + PARRY_BEAT.hold)
+	state.parrySerial += 1
+	local serial = state.parrySerial
+
+	if INPUT_DEBUG then
+		print(`[CombatController][Input] [F] parry stance up: window {string.format("%.2f", window)}s`)
+	end
+
+	if character then
+		poseGuard(character, PARRY_BEAT.pose, PARRY_BEAT.out)
+	end
 	addFov(-2.5)
 	addRoll(2)
 	playOneShot(FXCFG.ParryClashAccent, 0.25, 1.6, root)
 
 	parryRemote:FireServer("Parry")
 
-	-- Hold past the window and the stance settles into a guard.
+	-- Window expired without a clash: a held key settles into the guard, a tap eases
+	-- the blade back down.
 	task.delay(window, function()
+		if serial ~= state.parrySerial then
+			return
+		end
 		if state.parryHeld then
 			state.guarding = true
+			state.parryStanceUntil = math.huge
 			parryRemote:FireServer("Guard")
+			return
 		end
-	end)
-
-	task.delay(window + 0.2, function()
-		if not state.parryHeld and not state.guarding then
-			holdGuardPose({ x = 0, y = 0, z = 0 })
+		state.parryStanceUntil = 0
+		if character then
+			settleToRest(character, PARRY_BEAT.back)
 		end
 	end)
 end
@@ -1225,9 +1886,22 @@ local function releaseGuard()
 	state.parryHeld = false
 	if state.guarding then
 		state.guarding = false
+		-- The held guard owns the stance for as long as it lasts, so releasing it is
+		-- what ends that ownership: without this the blade would stay raised.
+		state.parryStanceUntil = 0
 		parryRemote:FireServer("Unguard")
 	end
-	holdGuardPose({ x = 0, y = 0, z = 0 })
+
+	local character = player.Character
+	if not character then
+		return
+	end
+	-- Inside the window (or a clash's extra 0.1s) the stance owns itself: its own
+	-- timer eases the blade home, so releasing the key early cannot cut it short.
+	if now() < state.parryStanceUntil then
+		return
+	end
+	settleToRest(character, PARRY_BEAT.back)
 end
 
 local function submitDodge()
@@ -1248,46 +1922,134 @@ local function submitDodge()
 	local cooldown = attrNumber(ATTR.DodgeCooldown, CombatConfig.Timings.DodgeCooldown)
 	state.dodgeCooldownUntil = timestamp + cooldown
 	player:SetAttribute(ATTR.DodgeReadyAt, state.dodgeCooldownUntil)
+	if INPUT_DEBUG then
+		print("[CombatController][Input] [Q/Shift] dodge")
+	end
 
 	local direction = if humanoid.MoveDirection.Magnitude > 0.1 then flat(humanoid.MoveDirection) else flat(root.CFrame.LookVector) * -1
 	dodgeDash(direction)
 	dodgeRemote:FireServer(direction)
 end
 
-ContextActionService:BindAction(ACTIONS.Attack, function(_, inputState)
-	if inputState == Enum.UserInputState.Begin then
-		submitAttack()
+--[[
+	Input: combat actions.
+	Every route goes through ContextActionService (so the touch buttons keep
+	working), and which key or mouse button an action answers to is owned by
+	KeybindManager -- a rebind in the options menu re-binds these actions live, with
+	no restart and no second listener to keep in sync. `GetInputs` hands back the
+	player's bind plus the static extras (Q for dodge, the gamepad shoulder
+	buttons), so the shipped controls never disappear.
+]]
+local function inputLabel(input: InputObject?): string
+	if not input then
+		return "?"
 	end
-	return Enum.ContextActionResult.Pass
-end, true, Enum.UserInputType.MouseButton1, Enum.KeyCode.ButtonR2)
+	if input.KeyCode ~= Enum.KeyCode.None then
+		return input.KeyCode.Name
+	end
+	return input.UserInputType.Name
+end
 
-ContextActionService:BindAction(ACTIONS.Parry, function(_, inputState)
+local function onAttackAction(_actionName: string, inputState: Enum.UserInputState, inputObject: InputObject)
+	if inputState ~= Enum.UserInputState.Begin then
+		return Enum.ContextActionResult.Pass
+	end
+	-- The menu owns the cursor: clicking PLAY must never also swing the sword.
+	if menuIsOpen() then
+		return Enum.ContextActionResult.Pass
+	end
+	if INPUT_DEBUG then
+		print(`[CombatController][Input] [{inputLabel(inputObject)}] attack`)
+	end
+	submitAttack()
+	return Enum.ContextActionResult.Pass
+end
+
+local function onParryAction(_actionName: string, inputState: Enum.UserInputState, inputObject: InputObject)
 	if inputState == Enum.UserInputState.Begin then
+		if menuIsOpen() then
+			return Enum.ContextActionResult.Pass
+		end
+		if INPUT_DEBUG then
+			print(`[CombatController][Input] [{inputLabel(inputObject)}] parry`)
+		end
 		state.parryHeld = true
 		submitParry()
 	elseif inputState == Enum.UserInputState.End or inputState == Enum.UserInputState.Cancel then
+		-- Released unconditionally: a guard let down is always safe, and a key the
+		-- menu swallowed on the way down must not stay held.
+		if INPUT_DEBUG then
+			print(`[CombatController][Input] [{inputLabel(inputObject)}] released ({inputState.Name})`)
+		end
 		releaseGuard()
 	end
 	return Enum.ContextActionResult.Pass
-end, true, Enum.KeyCode.F, Enum.KeyCode.ButtonL2)
+end
 
-ContextActionService:BindAction(ACTIONS.Dodge, function(_, inputState)
-	if inputState == Enum.UserInputState.Begin then
-		submitDodge()
+local function onDodgeAction(_actionName: string, inputState: Enum.UserInputState, inputObject: InputObject)
+	if inputState ~= Enum.UserInputState.Begin then
+		return Enum.ContextActionResult.Pass
 	end
+	if menuIsOpen() then
+		return Enum.ContextActionResult.Pass
+	end
+	if INPUT_DEBUG then
+		print(`[CombatController][Input] [{inputLabel(inputObject)}] dodge`)
+	end
+	submitDodge()
 	return Enum.ContextActionResult.Pass
-end, true, Enum.KeyCode.Q, Enum.KeyCode.LeftShift, Enum.KeyCode.ButtonL1)
+end
 
-ContextActionService:SetTitle(ACTIONS.Attack, "Slash")
-ContextActionService:SetTitle(ACTIONS.Parry, "Parry")
-ContextActionService:SetTitle(ACTIONS.Dodge, "Dodge")
-ContextActionService:SetPosition(ACTIONS.Dodge, UDim2.new(1, -110, 1, -170))
+local keybindsBound = false
+
+local function bindKeybinds()
+	if keybindsBound then
+		ContextActionService:UnbindAction(ACTIONS.Attack)
+		ContextActionService:UnbindAction(ACTIONS.Parry)
+		ContextActionService:UnbindAction(ACTIONS.Dodge)
+		keybindsBound = false
+	end
+
+	-- A rebind mid-guard would strand the stance on a key that no longer exists.
+	if state.parryHeld then
+		releaseGuard()
+	end
+
+	ContextActionService:BindAction(ACTIONS.Attack, onAttackAction, true, table.unpack(KeybindManager:GetInputs("Attack")))
+	ContextActionService:BindAction(ACTIONS.Parry, onParryAction, true, table.unpack(KeybindManager:GetInputs("Parry")))
+	ContextActionService:BindAction(ACTIONS.Dodge, onDodgeAction, true, table.unpack(KeybindManager:GetInputs("Dodge")))
+
+	ContextActionService:SetTitle(ACTIONS.Attack, "Slash")
+	ContextActionService:SetTitle(ACTIONS.Parry, "Parry")
+	ContextActionService:SetTitle(ACTIONS.Dodge, "Dodge")
+	ContextActionService:SetPosition(ACTIONS.Dodge, UDim2.new(1, -110, 1, -170))
+	keybindsBound = true
+end
+
+bindKeybinds()
+-- Fires with the action that changed, or with nothing after a bulk reset; either
+-- way the cheapest correct answer is to rebuild all three bindings.
+KeybindManager.OnBindChanged.Event:Connect(bindKeybinds)
 
 -- ---------------------------------------------------------------------------
--- Double jump
+-- Air jump (the "double jump")
 -- ---------------------------------------------------------------------------
 
-local function bindDoubleJump(humanoid: Humanoid)
+--[[
+	Faster than this and the body is still climbing on the previous boost.
+	JumpRequest is documented to fire twice for a single press, and the engine's
+	auto-hop keeps requesting while the key is held; either one would otherwise
+	spend the air jump on the same frame the ground jump left. Nothing deliberate
+	happens while the body is climbing this fast -- gravity has it near the apex by
+	the time the player's second tap lands. That is about the first seventh of a
+	second of the hop, and a request refused here costs nothing -- the allowance is
+	only spent by a jump that actually fires, so an early tap can simply be repeated.
+]]
+local AIR_JUMP_MAX_RISE = 26
+
+-- Refills the allowance the moment the feet touch something: landing, running
+-- again, sitting, standing up. Everything that means "grounded".
+local function bindAirJumpAllowance(humanoid: Humanoid)
 	state.airJumpsUsed = 0
 	humanoid.StateChanged:Connect(function(_, newState: Enum.HumanoidStateType)
 		if
@@ -1308,16 +2070,34 @@ UserInputService.JumpRequest:Connect(function()
 		return
 	end
 
-	local extraJumps = attrNumber(ATTR.ExtraJumps, 0)
-	if extraJumps <= 0 or state.airJumpsUsed >= extraJumps then
+	--[[
+		Both airborne states count. The Humanoid sits in `Jumping` for the first
+		frames of a hop before settling into `Freefall`, and a player who taps twice
+		quickly is asking for the second jump while still in the first of those. Being
+		on the ground is never in question here: a grounded JumpRequest is the engine's
+		own jump, and the allowance only refills on landing.
+	]]
+	local humanoidState = humanoid:GetState()
+	if humanoidState ~= Enum.HumanoidStateType.Freefall and humanoidState ~= Enum.HumanoidStateType.Jumping then
 		return
 	end
-	if humanoid:GetState() ~= Enum.HumanoidStateType.Freefall then
+	if root.AssemblyLinearVelocity.Y > AIR_JUMP_MAX_RISE then
+		return
+	end
+
+	-- Base allowance plus every perk that granted one, folded server-side.
+	local extraJumps = attrNumber(ATTR.ExtraJumps, CombatConfig.Player.AirJumps)
+	if extraJumps <= 0 or state.airJumpsUsed >= extraJumps then
 		return
 	end
 
 	state.airJumpsUsed += 1
-	root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 54, root.AssemblyLinearVelocity.Z)
+	root.AssemblyLinearVelocity = Vector3.new(
+		root.AssemblyLinearVelocity.X,
+		CombatConfig.Player.AirJumpImpulse,
+		root.AssemblyLinearVelocity.Z
+	)
+	airJumpPuff(root)
 	playOneShot(FXCFG.DodgeWhoosh, 0.3, 1.5, root)
 	addFov(4)
 	addRoll(-1.5)
@@ -1330,12 +2110,22 @@ local function bindCharacter(character: Model)
 
 	local humanoid = character:WaitForChild("Humanoid", 10)
 	if humanoid and humanoid:IsA("Humanoid") then
-		bindDoubleJump(humanoid)
+		bindAirJumpAllowance(humanoid)
+		-- A body must not keep the last swing's pose on its shoulder after death,
+		-- nor the default idle layers weighted out.
+		humanoid.Died:Once(function()
+			restoreArmPose(character)
+			endArmOverride(character)
+		end)
 	end
 	-- Warm the sword cache and repair the grip weld if replication was partial.
 	task.delay(0.5, function()
 		ensureKatanaWeld(character)
 		getSword(character)
+		-- The stock fallback clips are Roblox assets that stream on first use:
+		-- start them here so a swing never spends its windup waiting on one.
+		Animations.track(character, "StockSlash", "Stock", Enum.AnimationPriority.Action4)
+		Animations.track(character, "StockHeavy", "Stock", Enum.AnimationPriority.Action4)
 	end)
 	task.delay(2, function()
 		ensureKatanaWeld(character)
@@ -1350,10 +2140,14 @@ player.CharacterAdded:Connect(bindCharacter)
 
 player.CharacterRemoving:Connect(function(character: Model)
 	-- Tracks, rigs and swing serials all belong to the body they were bound to.
+	endArmOverride(character)
 	Animations.forget(character)
 	swords[character] = nil
 	armRigs[character] = nil
-	armTweens[character] = nil
+	armDrives[character] = nil
+	armHolds[character] = nil
+	armSuppressed[character] = nil
+	armOverride[character] = nil
 	trailSerial[character] = nil
 end)
 
@@ -1411,6 +2205,10 @@ fxRemote.OnClientEvent:Connect(function(payload: unknown)
 		flash(parryFlash, 0.6, 0.35)
 		playOneShot(FXCFG.ParryClash, 0.7, 1, nil)
 		if isMine then
+			-- The clash owns the stance from here: the window's own timer must not ease
+			-- the block home underneath the extra hold.
+			state.parrySerial += 1
+			state.parryStanceUntil = now() + PARRY_BEAT.successHold
 			-- A perfect read shortens the cooldown server-side; mirror it locally
 			-- so the HUD's parry badge flips back to ready on time.
 			state.parryCooldownUntil = math.min(state.parryCooldownUntil, now() + 0.12)
@@ -1422,10 +2220,20 @@ fxRemote.OnClientEvent:Connect(function(payload: unknown)
 			if (fx.amount or 0) > 0 then
 				flash(riposteFrame, 0.35, 0.5)
 			end
-			holdGuardPose(POSES.ParryRiposte)
-			task.delay(0.25, function()
-				if not state.guarding then
-					holdGuardPose({ x = 0, y = 0, z = 0 })
+			-- Hold the block 0.1s longer, then ease home over 0.15s. A key still held
+			-- settles into the guard instead of dropping the stance.
+			task.delay(PARRY_BEAT.successHold, function()
+				if state.parryHeld then
+					-- A key still held keeps the block, and the server has to hear about it:
+					-- the clash cancelled the window timer that would normally send this.
+					state.guarding = true
+					state.parryStanceUntil = math.huge
+					parryRemote:FireServer("Guard")
+					return
+				end
+				state.parryStanceUntil = 0
+				if character then
+					settleToRest(character, PARRY_BEAT.back)
 				end
 			end)
 		end
@@ -1481,13 +2289,12 @@ fxRemote.OnClientEvent:Connect(function(payload: unknown)
 		addFov(8)
 	elseif action == "Parry" then
 		if not isMine and character then
-			local rig = getArmRig(character)
-			if rig then
-				applyArmTargets(swingBeat(rig, POSES.ParryGuard, "Guard", false))
-				task.delay(0.35, function()
-					applyArmTargets(swingBeat(rig, REST_POSE, "Rest", false))
-				end)
-			end
+			-- The same stance the local player gets, so a parry reads identically
+			-- from either side of a blade.
+			poseGuard(character, PARRY_BEAT.pose, PARRY_BEAT.out)
+			task.delay(PARRY_BEAT.hold, function()
+				settleToRest(character, PARRY_BEAT.back)
+			end)
 		end
 	elseif action == "Dodge" then
 		if not isMine and character and character.PrimaryPart then

@@ -30,7 +30,12 @@ For more help, check out [the Rojo documentation](https://rojo.space/docs).
 | Sword attack (3-hit stance combo) | Left Click / `R2` |
 | Parry (tap), guard (hold) | `F` / `L2` |
 | Directional dodge dash | `Q`, `Shift`, or `L1` + movement direction |
-| Extra air jump | Press Jump mid-air (needs the *Double Jump* perk) |
+| Air jump (double jump) | Press Jump again while airborne - one per airtime |
+| Options / keybinds | `O` mid-run, or `OPTIONS` on the title screen |
+
+The air jump is part of every fighter's kit from wave one: jump, then jump again in mid-air for a second kick, marked by a shockwave and a puff of sparks at your feet. The *Air Step* perk stacks a third one on top.
+
+Every one of those is rebindable, including the `Options` key itself: open the panel and click a bind chip (or anywhere on its row), then press the key you want. `RESTORE DEFAULTS` puts the shipped controls back. Rebinds are per-session.
 
 Three attacks inside the `1.2s` combo window finish with the heavy finisher *Heaven's Fall*.
 
@@ -51,6 +56,7 @@ src/
     CombatConfig.luau            timings, combo steps, enemy archetypes, poses, attributes
     RigAnimationPack.luau        bakes rig clips into KeyframeSequences + reports their ids
     Animations.luau              optional-clip plumbing: id -> Animation instance -> fallback
+    KeybindManager.luau          the action -> input store every control reads
     PerkDatabase.luau            perk registry, rolling, stat folding
     Remotes.luau                 remote/signal registry + payload types
   server/                        -> ServerScriptService.Server
@@ -58,13 +64,41 @@ src/
     EnemyAI.server.luau          enemy rigs, telegraphs, strike resolution, poise
     WaveManager.server.luau      escalation curve, perk pauses, party heal
     KatanaFactory.luau           shared sword rig builder + arm poser
+    EnvironmentSetup.server.luau arena floor, wooden palisade wall, lamp posts, dusk lighting
   client/                        -> StarterPlayer.StarterPlayerScripts.Client
     CombatController.client.luau input, camera shake/FOV, sword posing, telegraph UI
     PerkUI.client.luau           perk cards, wave banner, HUD, health bar
     CombatHUD.client.luau        control hints + live parry/dodge cooldown badges
+    MainMenuUI.client.luau       title screen, credits, [ OPTIONS ]
+    OptionsOverlay.client.luau   the same options panel, reachable mid-run
+    OptionsMenu.luau             the keybind modal itself (shared by both hosts)
+    UiTheme.luau                 one palette for every menu
 ```
 
 ## Animating a rig
+
+Clips are optional, and this repo ships without any. Every attack and parry resolves through three
+layers, in order:
+
+1. An authored clip -- an id in `CombatConfig.Animations`, or an `Animation` instance on the rig.
+2. Roblox's own **stock sword clips** (`CombatConfig.Animations.Stock`: `rbxassetid://507770238`
+   for R15, `rbxassetid://129961376` for R6). They need no asset ownership and load for every
+   account, so the fallback works on a freshly synced place with nothing authored.
+3. The **procedural frame override**: the sword arm is driven onto its captured rest offset --
+   `out` into the cut pose, `hold` through the hit, `back` to idle -- so the game animates even if
+   no asset loads at all. Poses and timings live in `CombatConfig.Procedural`, and `Flip` there is
+   the one-line mirror fix for a rig whose shoulder axes run the other way.
+
+Both clip layers play at `AnimationPriority.Action4`, above everything the default `Animate`
+script uses, and for the duration of an action the default idle/tool tracks are weighted to zero --
+those tracks write the same joints, so without that the arm ends up halfway between idle and
+attack. Their original weights are handed back the moment the action ends.
+
+Poses are written to each joint's own offset -- `Motor6D.C0`, or `AnimationConstraint.Transform` on
+the newer joint type -- and never to `Motor6D.Transform`, which the `Animate` script and every
+playing track own and rewrite each frame. Interpolation and the re-assert both run in
+`RunService.PreSimulation`, after the Animator has evaluated the frame, so the last write before
+the frame is drawn is the script's.
 
 Animation **asset ids only exist once a KeyframeSequence has been uploaded to Roblox**. The
 Animation Editor (or Open Cloud, with an API key) does the uploading; nothing in this repo can do
@@ -80,8 +114,9 @@ pack.preview(workspace.Rig)   -- walk, run, slash, guard (play mode)
 ```
 
 `install` bakes Walk, Run, Slash1, Slash2, Heavy, Guard and Parry out of the game's *own* tuned
-numbers -- the same `CombatConfig.Poses` and `SwingRig` values `CombatController` writes to each
-joint -- so a rig wearing the clips moves the way the game already moves. It then:
+numbers -- the same `CombatConfig.Procedural` beats and `SwingRig` folds `CombatController` drives
+onto each joint's rest offset -- so a rig wearing the clips moves the way the game already moves. It
+then:
 
 1. registers each clip with `KeyframeSequenceProvider`, which makes it playable immediately,
 2. attaches an `Animation` instance to the rig under its `CombatConfig.Animations.Aliases` name,

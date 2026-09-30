@@ -8,6 +8,9 @@
 		[F]          Parry / Block (0.2s Window)
 		[Shift / Q]  Dodge Dash
 
+	The key chips show the player's live binds (KeybindManager), so a rebind in the
+	options menu lands here the moment it is made instead of going stale.
+
 	Parry and Dodge dim with a shrinking bar + countdown while they recharge,
 	driven by the client-local `CB_ParryReadyAt` / `CB_DodgeReadyAt` attributes
 	that CombatController writes on use. Attack has no cooldown, so its badge is
@@ -23,6 +26,7 @@ local RunService = game:GetService("RunService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local CombatConfig = require(Shared:WaitForChild("CombatConfig"))
+local KeybindManager = require(Shared:WaitForChild("KeybindManager"))
 
 local ATTR = CombatConfig.Attributes
 local player = Players.LocalPlayer
@@ -222,6 +226,36 @@ end
 newBadge("attack", "LMB", "Slash Combo", "3-hit stance combo", PALETTE.Slash)
 newBadge("parry", "F", "Parry / Block", "0.2s Window", PALETTE.Parry)
 newBadge("dodge", "Shift/Q", "Dodge Dash", "Directional i-frames", PALETTE.Dodge)
+
+-- ---------------------------------------------------------------------------
+-- Live key glyphs
+--   The binds are KeybindManager's to own: a rebind in the options menu has to
+--   show up here without a relog, so the chips are painted from the manager and
+--   repainted whenever a bind changes.
+-- ---------------------------------------------------------------------------
+
+-- The shared store's own action names, so a badge's action flows into
+-- KeybindManager without a cast.
+type ActionName = KeybindManager.ActionName
+
+local GLYPH_ACTION: { [BadgeKind]: ActionName } = {
+	attack = "Attack",
+	parry = "Parry",
+	dodge = "Dodge",
+}
+
+local function syncBindLabels()
+	for _, badge in badges do
+		-- Annotated, not inferred: Luau widens a singleton union in an inferred local.
+		local action: ActionName? = GLYPH_ACTION[badge.kind]
+		if action then
+			badge.key.Text = KeybindManager:ShortLabel(action)
+		end
+	end
+end
+
+syncBindLabels()
+KeybindManager.OnBindChanged.Event:Connect(syncBindLabels)
 
 -- ---------------------------------------------------------------------------
 -- Live cooldown readout
