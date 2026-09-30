@@ -12,6 +12,10 @@
 	    crimson inner line, and eight wooden lamp posts carrying amber lanterns.
 	  * Dusk lighting: 19:00 sun, dense horizon Atmosphere haze, Bloom to make the
 	    blade ribbons glow, and a high-contrast ColorCorrection for the samurai look.
+	  * A prehistoric-medieval skyline outside the palisade: a ground slab, giant
+	    tree ferns, crumbling castles, smoking volcanoes and dinosaur silhouettes.
+	    Every piece is anchored, non-collidable and non-queryable, so the floor,
+	    the wave spawner and the katana hitboxes never notice it is there.
 
 	Re-running is safe: the stage lives under one folder and is replaced, never
 	doubled, which matters when a live Rojo sync restarts the script.
@@ -135,6 +139,55 @@ local SETTINGS = {
 
 	SunRaysIntensity = 0.02,
 	SunRaysSpread = 0.55,
+
+	--[[
+		Scenery: the prehistoric-medieval skyline outside the palisade.
+
+		Every piece is anchored, `CanCollide = false`, `CanTouch = false` and
+		`CanQuery = false`, so no walkable surface, no hitbox and no raycast in the
+		combat systems can ever see it. It is parented under the arena folder and
+		rebuilt with it, so a live sync never stacks two skylines.
+
+		Radii are measured from the arena centre; `SceneryMinRadius` sits clear of
+		both the bed (Radius + 5) and the spawn ring (SpawnMaxDistance 62).
+	]]
+	SceneryEnabled = true,
+	-- A single ground slab under everything, so the skyline does not float. Its top
+	-- sits below the tile tops, out of contention with the floor plane.
+	SceneryGroundTop = -0.8,
+	SceneryGroundSize = 1700,
+	SceneryGroundColor = Color3.fromRGB(46, 58, 44),
+	-- Rock under a castle: duller and browner than the fern ground.
+	SteppeGroundColor = Color3.fromRGB(70, 64, 54),
+
+	FernCount = 22,
+	FernRadiusMin = ARENA.Radius + 22,
+	FernRadiusMax = ARENA.Radius + 96,
+	FernTrunkColor = Color3.fromRGB(46, 62, 40),
+	FernFrondColor = Color3.fromRGB(60, 96, 48),
+	FernFrondColorAlt = Color3.fromRGB(44, 78, 40),
+
+	CastleCount = 5,
+	CastleRadiusMin = ARENA.Radius + 118,
+	CastleRadiusMax = ARENA.Radius + 188,
+	CastleStoneColor = Color3.fromRGB(90, 88, 94),
+	CastleStoneColorAlt = Color3.fromRGB(72, 70, 78),
+	CastleRoofColor = Color3.fromRGB(74, 46, 40),
+	CastleBannerColor = Color3.fromRGB(146, 42, 48),
+
+	VolcanoCount = 3,
+	VolcanoRadiusMin = ARENA.Radius + 205,
+	VolcanoRadiusMax = ARENA.Radius + 330,
+	VolcanoHeight = 150,
+	VolcanoRockColor = Color3.fromRGB(56, 48, 48),
+	VolcanoRockColorAlt = Color3.fromRGB(40, 34, 36),
+	LavaColor = Color3.fromRGB(255, 122, 42),
+
+	DinoCount = 4,
+	DinoRadiusMin = ARENA.Radius + 168,
+	DinoRadiusMax = ARENA.Radius + 262,
+	-- Near-black: these are silhouettes against the dusk, not creatures to inspect.
+	DinoColor = Color3.fromRGB(26, 28, 32),
 }
 
 -- ---------------------------------------------------------------------------
@@ -501,6 +554,378 @@ end
 end
 
 -- ---------------------------------------------------------------------------
+-- Scenery
+--   A blend of the two halves of the setting: crumbling castles and palisade-era
+--   masonry standing in a prehistoric land of volcanoes, giant ferns and the
+--   silhouettes of things that no longer fit on a battlefield.
+--
+--   Nothing here is gameplay. Every part is anchored and stripped of collision,
+--   touch and query so the wave AI, the katana hitboxes and any future raycast all
+--   look straight through it. The layout is deterministic (the floor and the
+--   palisade already promise two servers see the same arena), jittered by a tiny
+--   LCG so the skyline is irregular without a random seed to drift on.
+-- ---------------------------------------------------------------------------
+
+-- Anchored, inert, and invisible to physics and spatial queries alike.
+local function sceneryPart(
+	name: string,
+	size: Vector3,
+	color: Color3,
+	material: Enum.Material
+): Part
+	local part = newPart(name, size, color, material)
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	-- A fifty-stud castle throwing a shadow across the arena would be a lighting
+	-- bug wearing a costume; distant props never cast.
+	part.CastShadow = false
+	return part
+end
+
+-- A part whose circular axis is laid along world Y (a standing column).
+local function columnPart(
+	name: string,
+	height: number,
+	diameter: number,
+	color: Color3,
+	material: Enum.Material
+): Part
+	local part = sceneryPart(name, Vector3.new(height, diameter, diameter), color, material)
+	part.Shape = Enum.PartType.Cylinder
+	return part
+end
+
+-- Deterministic jitter: same index, same salt, same skyline on every server.
+local function makeRandom(seed: number): () -> number
+	local state = seed
+	return function(): number
+		state = (state * 1103515245 + 12345) % 2147483648
+		return state / 2147483648
+	end
+end
+
+local function buildSceneryGround(parent: Instance)
+	local ground = sceneryPart(
+		"DistantGround",
+		Vector3.new(SETTINGS.SceneryGroundSize, 8, SETTINGS.SceneryGroundSize),
+		SETTINGS.SceneryGroundColor,
+		Enum.Material.Ground
+	)
+	-- Top face lands on SceneryGroundTop, below the tile plane.
+	ground.Position = Vector3.new(0, SETTINGS.SceneryGroundTop - 4, 0)
+	ground.Parent = parent
+end
+
+-- Giant tree ferns: a bare trunk crowned with drooping fronds.
+local function buildFerns(parent: Instance)
+	local ferns = Instance.new("Model")
+	ferns.Name = "Ferns"
+	local random = makeRandom(9741)
+	local span = SETTINGS.FernRadiusMax - SETTINGS.FernRadiusMin
+
+	for index = 1, SETTINGS.FernCount do
+		local angle = (index / SETTINGS.FernCount) * math.pi * 2 + (random() - 0.5) * 0.5
+		local radius = SETTINGS.FernRadiusMin + random() * span
+		local x = math.cos(angle) * radius
+		local z = math.sin(angle) * radius
+		local height = 9 + random() * 11
+		local width = height * 0.09
+
+		local trunk = columnPart(`Fern_{index}_Trunk`, height, width, SETTINGS.FernTrunkColor, Enum.Material.Wood)
+		trunk.CFrame = CFrame.new(x, height * 0.5 - 0.8, z) * CFrame.Angles(0, 0, math.rad(90))
+		trunk.Parent = ferns
+
+		local top = Vector3.new(x, height - 0.8, z)
+		local fronds = 7
+		for frond = 1, fronds do
+			local spread = (frond / fronds) * math.pi * 2 + random() * 0.4
+			local length = height * (0.55 + random() * 0.25)
+			local tip = top
+				+ Vector3.new(math.cos(spread), 0, math.sin(spread)) * length
+				- Vector3.new(0, length * (0.35 + random() * 0.25), 0)
+			local leaf = sceneryPart(
+				`Fern_{index}_Frond_{frond}`,
+				Vector3.new(length * 0.16, 0.2, length),
+				if frond % 2 == 0 then SETTINGS.FernFrondColor else SETTINGS.FernFrondColorAlt,
+				Enum.Material.Grass
+			)
+			leaf.CFrame = CFrame.lookAt((top + tip) * 0.5, tip)
+			leaf.Parent = ferns
+		end
+	end
+
+	ferns.Parent = parent
+end
+
+-- A crumbled keep: a rock plateau, a battlemented tower and three broken ones.
+local function buildCastles(parent: Instance)
+	local castles = Instance.new("Model")
+	castles.Name = "Castles"
+	local random = makeRandom(50219)
+	local span = SETTINGS.CastleRadiusMax - SETTINGS.CastleRadiusMin
+
+	for index = 1, SETTINGS.CastleCount do
+		local angle = (index / SETTINGS.CastleCount) * math.pi * 2 + (random() - 0.5) * 0.6
+		local radius = SETTINGS.CastleRadiusMin + random() * span
+		local x = math.cos(angle) * radius
+		local z = math.sin(angle) * radius
+		local scale = 0.85 + random() * 0.55
+
+		local plateauHeight = 7 * scale
+		local plateau = columnPart(
+			`Castle_{index}_Plateau`,
+			plateauHeight,
+			46 * scale,
+			SETTINGS.SteppeGroundColor,
+			Enum.Material.Rock
+		)
+		plateau.CFrame = CFrame.new(x, plateauHeight * 0.5 - 1.4, z) * CFrame.Angles(0, 0, math.rad(90))
+		plateau.Parent = castles
+
+		local top = plateauHeight - 1.4
+		local keepHeight = 24 * scale
+		local keep = sceneryPart(
+			`Castle_{index}_Keep`,
+			Vector3.new(15 * scale, keepHeight, 15 * scale),
+			SETTINGS.CastleStoneColor,
+			Enum.Material.Slate
+		)
+		keep.CFrame = CFrame.new(x, top + keepHeight * 0.5, z) * CFrame.Angles(0, random() * 0.7, 0)
+		keep.Parent = castles
+
+		-- Battlements: eight crenellations around the keep's cap.
+		for merlon = 1, 8 do
+			local ma = (merlon / 8) * math.pi * 2
+			local block = sceneryPart(
+				`Castle_{index}_Merlon_{merlon}`,
+				Vector3.new(2.2 * scale, 2.4 * scale, 2.2 * scale),
+				SETTINGS.CastleStoneColorAlt,
+				Enum.Material.Slate
+			)
+			block.CFrame = CFrame.new(x + math.cos(ma) * 7 * scale, top + keepHeight + 1 * scale, z + math.sin(ma) * 7 * scale)
+			block.Parent = castles
+		end
+
+		-- Towers: two intact, one sheared off, one leaning into its own ruin.
+		local cornerCount = 4
+		for corner = 1, cornerCount do
+			local ca = (corner / cornerCount) * math.pi * 2 + 0.4
+			local tx = x + math.cos(ca) * 16 * scale
+			local tz = z + math.sin(ca) * 16 * scale
+			local broken = corner == 3
+			local leaning = corner == 4
+			local towerHeight = (if broken then 12 else 22) * scale
+			local tower = columnPart(
+				`Castle_{index}_Tower_{corner}`,
+				towerHeight,
+				7 * scale,
+				SETTINGS.CastleStoneColor,
+				Enum.Material.Slate
+			)
+			local towerCFrame = CFrame.new(tx, top + towerHeight * 0.5, tz)
+				* CFrame.Angles(0, 0, math.rad(90))
+			if leaning then
+				towerCFrame = towerCFrame * CFrame.Angles(0, 0, math.rad(11))
+			end
+			tower.CFrame = towerCFrame
+			tower.Parent = castles
+
+			-- A conical roof on the intact towers only.
+			if not broken then
+				local roof = columnPart(
+					`Castle_{index}_Roof_{corner}`,
+					7 * scale,
+					8.4 * scale,
+					SETTINGS.CastleRoofColor,
+					Enum.Material.Slate
+				)
+				roof.CFrame = CFrame.new(tx, top + towerHeight + 3 * scale, tz) * CFrame.Angles(0, 0, math.rad(90))
+				roof.Parent = castles
+			end
+		end
+
+		-- One banner on the keep, so a castle reads as held rather than abandoned.
+		local banner = sceneryPart(
+			`Castle_{index}_Banner`,
+			Vector3.new(3.4 * scale, 9 * scale, 0.25),
+			SETTINGS.CastleBannerColor,
+			Enum.Material.Fabric
+		)
+		banner.CFrame = CFrame.new(x + 7.6 * scale, top + keepHeight * 0.62, z)
+		banner.Parent = castles
+	end
+
+	castles.Parent = parent
+end
+
+-- Shield volcanoes: stacked rock rings around a live, glowing crater.
+local function buildVolcanoes(parent: Instance)
+	local volcanoes = Instance.new("Model")
+	volcanoes.Name = "Volcanoes"
+	local random = makeRandom(31877)
+	local span = SETTINGS.VolcanoRadiusMax - SETTINGS.VolcanoRadiusMin
+	local layers = 7
+
+	for index = 1, SETTINGS.VolcanoCount do
+		local angle = (index / SETTINGS.VolcanoCount) * math.pi * 2 + (random() - 0.5) * 0.8
+		local radius = SETTINGS.VolcanoRadiusMin + random() * span
+		local x = math.cos(angle) * radius
+		local z = math.sin(angle) * radius
+		local height = SETTINGS.VolcanoHeight * (0.8 + random() * 0.45)
+		local baseDiameter = height * 1.7
+		local craterDiameter = baseDiameter * 0.2
+		local layerHeight = (height / layers) * 1.15
+
+		for layer = 1, layers do
+			local t = (layer - 1) / layers
+			local diameter = baseDiameter * (1 - t) + craterDiameter * t
+			local ring = columnPart(
+				`Volcano_{index}_Layer_{layer}`,
+				layerHeight,
+				diameter,
+				if layer % 2 == 0 then SETTINGS.VolcanoRockColorAlt else SETTINGS.VolcanoRockColor,
+				Enum.Material.Rock
+			)
+			ring.CFrame = CFrame.new(x, -1 + (layer - 0.5) * (height / layers), z) * CFrame.Angles(0, 0, math.rad(90))
+			ring.Parent = volcanoes
+		end
+
+		local craterY = -1 + height + 0.4
+		local lava = columnPart(
+			`Volcano_{index}_Lava`,
+			1.6,
+			craterDiameter * 0.92,
+			SETTINGS.LavaColor,
+			Enum.Material.Neon
+		)
+		lava.CFrame = CFrame.new(x, craterY, z) * CFrame.Angles(0, 0, math.rad(90))
+		lava.Parent = volcanoes
+
+		-- A broad, low-range glow: the crater should stain the seared rock around it,
+		-- not light the arena fifty studs away.
+		local glow = Instance.new("PointLight")
+		glow.Name = "CraterGlow"
+		glow.Color = SETTINGS.LavaColor
+		glow.Brightness = 3
+		glow.Range = height * 1.8
+		glow.Shadows = false
+		glow.Parent = lava
+
+		-- A lava spill running down one flank.
+		local spillAngle = random() * math.pi * 2
+		local spillTop = Vector3.new(x + math.cos(spillAngle) * craterDiameter * 0.6, craterY, z + math.sin(spillAngle) * craterDiameter * 0.6)
+		local spillBottom = Vector3.new(
+			x + math.cos(spillAngle) * baseDiameter * 0.42,
+			-1,
+			z + math.sin(spillAngle) * baseDiameter * 0.42
+		)
+		local spill = sceneryPart(
+			`Volcano_{index}_Spill`,
+			Vector3.new(3.2, 0.5, (spillBottom - spillTop).Magnitude),
+			SETTINGS.LavaColor,
+			Enum.Material.Neon
+		)
+		spill.CFrame = CFrame.lookAt((spillTop + spillBottom) * 0.5, spillBottom)
+		spill.Parent = volcanoes
+
+		local smoke = Instance.new("ParticleEmitter")
+		smoke.Name = "AshPlume"
+		smoke.Color = ColorSequence.new(Color3.fromRGB(70, 66, 68), Color3.fromRGB(120, 116, 118))
+		smoke.LightEmission = 0
+		smoke.LightInfluence = 0
+		smoke.Size = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, height * 0.35),
+			NumberSequenceKeypoint.new(1, height * 0.9),
+		})
+		smoke.Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.35),
+			NumberSequenceKeypoint.new(1, 1),
+		})
+		smoke.Speed = NumberRange.new(12, 22)
+		smoke.Lifetime = NumberRange.new(6, 10)
+		smoke.Rate = 6
+		smoke.EmissionDirection = Enum.NormalId.Top
+		smoke.Parent = lava
+	end
+
+	volcanoes.Parent = parent
+end
+
+-- Distant dinosaur silhouettes: three boxes of spine, a neck, a tail and legs.
+local function buildDinosaurSilhouettes(parent: Instance)
+	local dinos = Instance.new("Model")
+	dinos.Name = "Silhouettes"
+	local random = makeRandom(61203)
+	local span = SETTINGS.DinoRadiusMax - SETTINGS.DinoRadiusMin
+	local material = Enum.Material.SmoothPlastic
+
+	for index = 1, SETTINGS.DinoCount do
+		local angle = (index / SETTINGS.DinoCount) * math.pi * 2 + (random() - 0.5) * 0.9
+		local radius = SETTINGS.DinoRadiusMin + random() * span
+		local unit = 9 + random() * 4
+		local base = CFrame.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
+			* CFrame.Angles(0, random() * math.pi * 2, 0)
+
+		local function limb(name: string, size: Vector3, offset: CFrame)
+			local part = sceneryPart(`Dino_{index}_{name}`, size, SETTINGS.DinoColor, material)
+			part.CFrame = base * offset
+			part.Parent = dinos
+			return part
+		end
+
+		-- Body, the trunk every other piece hangs off.
+		limb("Body", Vector3.new(unit * 1.1, unit * 1.1, unit * 2.8), CFrame.new(0, unit * 2.1, 0))
+		-- Legs: four columns, back pair thicker as befits a sauropod.
+		for leg = 1, 4 do
+			local front = leg <= 2
+			local left = leg % 2 == 0
+			limb(
+				`Leg_{leg}`,
+				Vector3.new(unit * 0.32, unit * 2.1, unit * 0.32),
+				CFrame.new((if left then -1 else 1) * unit * 0.55, unit, (if front then -1 else 1) * unit * 0.85)
+			)
+		end
+
+		-- Neck rising forward, head at its tip.
+		local neckTop = Vector3.new(0, unit * 5.0, -unit * 2.4)
+		local neck = limb(
+			"Neck",
+			Vector3.new(unit * 0.4, unit * 0.4, unit * 2.0),
+			CFrame.new()
+		)
+		local neckBase = Vector3.new(0, unit * 2.6, -unit * 1.3)
+		neck.CFrame = base * CFrame.lookAt(neckBase:Lerp(neckTop, 0.5), neckTop)
+		limb("Head", Vector3.new(unit * 0.5, unit * 0.45, unit * 0.8), CFrame.new(0, unit * 5.1, -unit * 2.9))
+
+		-- Tail counterbalancing behind.
+		local tailTip = Vector3.new(0, unit * 1.1, unit * 4.2)
+		local tail = limb("Tail", Vector3.new(unit * 0.35, unit * 0.35, unit * 3.0), CFrame.new())
+		local tailBase = Vector3.new(0, unit * 2.4, unit * 1.3)
+		tail.CFrame = base * CFrame.lookAt(tailBase:Lerp(tailTip, 0.5), tailTip)
+	end
+
+	dinos.Parent = parent
+end
+
+local function buildScenery(parent: Instance)
+	if not SETTINGS.SceneryEnabled then
+		return
+	end
+
+	local scenery = Instance.new("Model")
+	scenery.Name = "Scenery"
+
+	buildSceneryGround(scenery)
+	buildFerns(scenery)
+	buildCastles(scenery)
+	buildVolcanoes(scenery)
+	buildDinosaurSilhouettes(scenery)
+
+	scenery.Parent = parent
+end
+
+-- ---------------------------------------------------------------------------
 -- Lighting
 -- ---------------------------------------------------------------------------
 
@@ -618,6 +1043,7 @@ arena.Parent = workspace
 buildFloor(arena)
 buildPerimeter(arena)
 buildDais(arena)
+buildScenery(arena)
 
 print(
 	`[EnvironmentSetup] Arena online: radius {ARENA.Radius}, boundary {ARENA.BoundaryRadius}, dusk lighting armed.`

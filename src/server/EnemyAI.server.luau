@@ -113,6 +113,7 @@ type Enemy = {
 -- ---------------------------------------------------------------------------
 
 local fxRemote = Remotes.server(NAMES.CombatFx)
+local bossRemote = Remotes.server(NAMES.BossState)
 local spawnSignal = Remotes.signal(NAMES.SpawnEnemy)
 local enemyHitSignal = Remotes.signal(NAMES.EnemyHit)
 local enemyKilledSignal = Remotes.signal(NAMES.EnemyKilled)
@@ -956,6 +957,16 @@ local function killEnemy(enemy: Enemy)
 		stepKind = enemy.archetype.id,
 	})
 
+	if enemy.model:GetAttribute(ATTR.Boss) == true then
+		-- Lower the client's bar the moment the boss dies, before the fade-out.
+		bossRemote:FireAllClients({
+			active = false,
+			wave = enemy.wave,
+			phase = "Defeated",
+			name = enemy.archetype.label,
+		} :: Remotes.BossPayload)
+	end
+
 	enemyKilledSignal:Fire(enemy.model)
 	fadeOut(enemy.model, SPAWN_GRACE + 0.25)
 	Debris:AddItem(enemy.model, 1.4)
@@ -1009,6 +1020,12 @@ local function spawnEnemy(request: Remotes.SpawnRequest): Enemy?
 	model:SetAttribute(ATTR.Knockback, 0)
 	model:SetAttribute(ATTR.Wave, request.wave)
 
+	-- Boss waves carry one named enemy; the tag is what the client reads to raise
+	-- the health bar and to keep the boss out of the ordinary enemy counter styling.
+	if request.boss then
+		model:SetAttribute(ATTR.Boss, true)
+	end
+
 	enemy.katana = KatanaFactory.attach(model)
 	local katana = enemy.katana
 	if katana then
@@ -1030,6 +1047,32 @@ local function spawnEnemy(request: Remotes.SpawnRequest): Enemy?
 	humanoid.Died:Connect(function()
 		killEnemy(enemy)
 	end)
+
+	-- Boss bar ownership: this script raises it with the real health pool and keeps
+	-- it honest through the fight; WaveManager only ever raises the "Incoming" banner.
+	if request.boss then
+		bossRemote:FireAllClients({
+			active = true,
+			wave = request.wave,
+			phase = "Fight",
+			name = archetype.label,
+			health = humanoid.Health,
+			maxHealth = humanoid.MaxHealth,
+		} :: Remotes.BossPayload)
+		humanoid.HealthChanged:Connect(function(health: number)
+			if enemy.phase == "Dead" then
+				return
+			end
+			bossRemote:FireAllClients({
+				active = true,
+				wave = request.wave,
+				phase = "Fight",
+				name = archetype.label,
+				health = health,
+				maxHealth = humanoid.MaxHealth,
+			} :: Remotes.BossPayload)
+		end)
+	end
 
 	active[model] = enemy
 	table.insert(order, model)
