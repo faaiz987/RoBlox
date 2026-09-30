@@ -88,6 +88,25 @@ export type WavePayload = {
 	endsAt: number?,
 	-- Optional banner text pushed to every client.
 	announcement: string?,
+	-- True while the announced wave is a boss wave, so the HUD can style it apart.
+	boss: boolean?,
+}
+
+--[[
+	Server -> every client: the boss channel.
+	One writer at a time: WaveManager raises the `Incoming` banner, EnemyAI then
+
+owns the live bar (`Fight` + health updates) and lowers it on death.
+]]
+export type BossPayload = {
+	-- False once the fight is over (or when a run resets the channel).
+	active: boolean,
+	wave: number,
+	-- "Incoming" | "Fight" | "Defeated"
+	phase: string,
+	name: string?,
+	health: number?,
+	maxHealth: number?,
 }
 
 -- Server -> EnemyAI: spawn one enemy for a wave.
@@ -100,6 +119,8 @@ export type SpawnRequest = {
 	damageMultiplier: number,
 	speedMultiplier: number,
 	unparryableOverride: boolean?,
+	-- Boss-wave spawn: EnemyAI tags the model and drives the `BossState` bar.
+	boss: boolean?,
 }
 
 -- ---------------------------------------------------------------------------
@@ -121,6 +142,7 @@ Remotes.Names = {
 	PerkChoice = "PerkChoice",
 	PerkGranted = "PerkGranted",
 	WaveState = "WaveState",
+	BossState = "BossState",
 
 	-- server -> server
 	SpawnEnemy = "SpawnEnemy",
@@ -141,6 +163,7 @@ local REMOTE_NAMES: { string } = {
 	Remotes.Names.PerkChoice,
 	Remotes.Names.PerkGranted,
 	Remotes.Names.WaveState,
+	Remotes.Names.BossState,
 }
 
 local SIGNAL_NAMES: { string } = {

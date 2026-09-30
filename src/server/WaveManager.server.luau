@@ -29,6 +29,7 @@ local ARENA = CombatConfig.Arena
 local TAG = CombatConfig.Tags.Enemy
 
 local waveRemote = Remotes.server(NAMES.WaveState)
+local bossRemote = Remotes.server(NAMES.BossState)
 local startRemote = Remotes.server(NAMES.StartWave)
 local spawnSignal = Remotes.signal(NAMES.SpawnEnemy)
 local waveClearedSignal = Remotes.signal(NAMES.WaveCleared)
@@ -46,7 +47,12 @@ type WavePlan = {
 	unparryableChance: number,
 	-- Relative spawn weights per archetype id.
 	weights: { [string]: number },
+	-- A boss plan spawns exactly one named boss instead of a crowd.
+	isBoss: boolean,
+	bossArchetype: string?,
 }
+
+local BOSS = CombatConfig.Boss
 
 -- Pacing constants
 local FIRST_WAVE_DELAY = 6
@@ -62,6 +68,8 @@ local waveNumber = 0
 local enemiesTotal = 0
 local enemiesSpawned = 0
 local runStarted = false
+-- True while the live wave is a boss wave; carried on the WaveState payload.
+local currentIsBoss = false
 -- Players who have pressed PLAY on the main menu.
 local readyPlayers = {} :: { [Player]: boolean }
 local rng = Random.new(DateTime.now().UnixTimestampMillis % 2 ^ 31)
@@ -94,6 +102,7 @@ local function broadcast(announcement: string?, endsAt: number?)
 		enemiesTotal = enemiesTotal,
 		endsAt = endsAt,
 		announcement = announcement,
+		boss = currentIsBoss,
 	}
 	waveRemote:FireAllClients(payload)
 	for _, player in Players:GetPlayers() do
@@ -108,6 +117,7 @@ local function sendState(player: Player)
 		enemiesRemaining = aliveEnemyCount(),
 		enemiesTotal = enemiesTotal,
 		announcement = nil,
+		boss = currentIsBoss,
 	} :: Remotes.WavePayload)
 end
 
@@ -125,7 +135,53 @@ end
 -- Escalation curve
 -- ---------------------------------------------------------------------------
 
+local function isBossWave(wave: number): boolean
+	return BOSS.EveryWaves > 0 and wave % BOSS.EveryWaves == 0
+end
+
+-- The archetype a boss wave rolls, walked in order so successive bosses alternate.
+local function bossArchetypeFor(wave: number): string?
+	local count = #BOSS.Archetypes
+	if count == 0 then
+		return nil
+	end
+	local index = math.floor(wave / BOSS.EveryWaves) - 1
+	return BOSS.Archetypes[(index % count) + 1]
+end
+
+local function bossLabel(plan: WavePlan): string
+	local id = plan.bossArchetype
+	local archetype = if id then CombatConfig.getEnemyArchetype(id) else nil
+	return if archetype then archetype.label else "Boss"
+end
+
 local function planFor(wave: number): WavePlan
+	--[[
+		Boss wave: one enemy, scaled harder than any crowd. The health and damage
+		bonuses stack on top of the ordinary escalation, so a wave-2 boss is still a
+		wall while a wave-12 boss is a wall the perks have to answer.
+	]]
+	if isBossWave(wave) then
+		local id = bossArchetypeFor(wave)
+		local weights: { [string]: number } = {}
+		if id then
+			weights[id] = 1
+		end
+		return {
+			wave = wave,
+			enemyCount = 1,
+			spawnInterval = 0.5,
+			maxConcurrent = 1,
+			healthMultiplier = (1 + (wave - 1) * 0.16) * BOSS.HealthMultiplier,
+			damageMultiplier = (1 + (wave - 1) * 0.1) * BOSS.DamageMultiplier,
+			speedMultiplier = math.min(1.25, 1 + (wave - 1) * 0.03),
+			unparryableChance = 0,
+			weights = weights,
+			isBoss = true,
+			bossArchetype = id,
+		}
+	end
+
 	local enemyCount = math.floor(4 + wave * 1.8 + math.max(0, wave - 6) * 1.4)
 	local spawnInterval = math.max(0.28, 1.5 - (wave - 1) * 0.09)
 	local maxConcurrent = math.min(ARENA.MaxAlive - 6, 8 + wave * 2)
@@ -150,6 +206,8 @@ local function planFor(wave: number): WavePlan
 		speedMultiplier = math.min(1.55, 1 + (wave - 1) * 0.045),
 		unparryableChance = math.clamp(0.1 + (wave - 1) * 0.05, 0, 0.5),
 		weights = weights,
+		isBoss = false,
+		bossArchetype = nil,
 	}
 end
 
@@ -196,6 +254,7 @@ local function buildSpawnRequest(plan: WavePlan, archetype: string, anchor: Play
 		damageMultiplier = plan.damageMultiplier,
 		speedMultiplier = plan.speedMultiplier,
 		unparryableOverride = rng:NextNumber() < plan.unparryableChance,
+		boss = plan.isBoss,
 	}
 end
 
@@ -204,7 +263,19 @@ local function runWave(plan: WavePlan)
 	phase = "Wave"
 	enemiesSpawned = 0
 	enemiesTotal = plan.enemyCount
-	broadcast(`WAVE {waveNumber}`)
+	if plan.isBoss then
+		-- The intermission already flashed the banner; raise the bar instead, and
+		-- let EnemyAI own it from the moment the boss actually exists.
+		bossRemote:FireAllClients({
+			active = true,
+			wave = waveNumber,
+			phase = "Incoming",
+			name = bossLabel(plan),
+		} :: Remotes.BossPayload)
+		broadcast()
+	else
+		broadcast(`WAVE {waveNumber}`)
+	end
 
 	while enemiesSpawned < enemiesTotal do
 		local players = livingPlayers()
@@ -343,17 +414,24 @@ task.spawn(function()
 	while true do
 		waveNumber += 1
 		local plan = planFor(waveNumber)
+		currentIsBoss = plan.isBoss
 		runWave(plan)
 
 		-- Field is empty: freeze the world and deal the cards.
 		phase = "PerkChoice"
 		enemiesTotal = 0
+		currentIsBoss = false
 		broadcast("WAVE CLEARED", workspace:GetServerTimeNow() + PERK_CHOICE_TIMEOUT)
 		healParty(CombatConfig.Player.WaveClearHeal)
 		waveClearedSignal:Fire(waveNumber)
 		waitForPicks()
 
-		intermission(INTERMISSION, `WAVE {waveNumber + 1} INCOMING`)
+		-- Name the next wave before it starts, so a boss gets its own banner.
+		if isBossWave(waveNumber + 1) then
+			intermission(INTERMISSION, `BOSS INCOMING -- WAVE {waveNumber + 1}`)
+		else
+			intermission(INTERMISSION, `WAVE {waveNumber + 1} INCOMING`)
+		end
 	end
 end)
 

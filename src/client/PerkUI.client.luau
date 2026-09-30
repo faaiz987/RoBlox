@@ -48,6 +48,7 @@ type WavePayload = {
 	enemiesTotal: number,
 	endsAt: number?,
 	announcement: string?,
+	boss: boolean?,
 }
 
 local player = Players.LocalPlayer
@@ -765,8 +766,13 @@ local function renderStatus()
 		waveLabel.Text = `WAVE {payload.wave} CLEARED`
 		statusLabel.Text = "Choose a perk to continue"
 	elseif payload.phase == "Wave" then
-		waveLabel.Text = `WAVE {payload.wave}`
-		statusLabel.Text = `ENEMIES {payload.enemiesRemaining} / {payload.enemiesTotal}`
+		-- A boss wave names itself; the boss bar itself is BossUI's job.
+		waveLabel.Text = if payload.boss then `BOSS WAVE {payload.wave}` else `WAVE {payload.wave}`
+		if payload.boss and payload.enemiesRemaining > 0 then
+			statusLabel.Text = "A challenger stalks the arena"
+		else
+			statusLabel.Text = `ENEMIES {payload.enemiesRemaining} / {payload.enemiesTotal}`
+		end
 	else
 		waveLabel.Text = if payload.wave > 0 then `WAVE {payload.wave} COMPLETE` else "GET READY"
 		statusLabel.Text = "Intermission"

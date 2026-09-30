@@ -321,6 +321,91 @@ CombatConfig.Enemies = {
 		glowColor = Color3.fromRGB(126, 208, 244),
 		bodyMaterial = Enum.Material.Fabric,
 	} :: EnemyArchetype,
+
+	--[[
+		Boss archetypes.
+		They are ordinary `EnemyArchetype` records on purpose: EnemyAI, CombatServer and
+		the hit pipeline already understand one shape, so a boss is a stat wall rather
+		than a second code path. Which archetype a boss wave rolls is driven by
+		`CombatConfig.Boss`.
+	]]
+	OniShogun = {
+		id = "OniShogun",
+		label = "Oni Shogun",
+		-- ~4x a Brute: a fight, not a speed bump, and scaled again by Boss.HealthMultiplier.
+		health = 320,
+		damage = 30,
+		moveSpeed = 9.5,
+		attackRange = 10,
+		attackHalfAngle = 85,
+		windup = 1.15,
+		recovery = 0.8,
+		unparryable = false,
+		poise = 220,
+		poiseRegen = 6,
+		-- Barely moves when hit: the fantasy is a wall you have to out-read.
+		knockbackResist = 0.85,
+		bodyColor = Color3.fromRGB(46, 26, 30),
+		accentColor = Color3.fromRGB(226, 178, 74),
+		limbColor = Color3.fromRGB(32, 18, 22),
+		eyeColor = Color3.fromRGB(255, 74, 44),
+		glowColor = Color3.fromRGB(255, 120, 42),
+		bodyMaterial = Enum.Material.Metal,
+	} :: EnemyArchetype,
+
+	FossilTyrant = {
+		id = "FossilTyrant",
+		label = "Fossil Tyrant",
+		-- The bigger, slower boss: more health and reach, a touch less bite.
+		health = 380,
+		damage = 26,
+		moveSpeed = 11,
+		attackRange = 11,
+		attackHalfAngle = 92,
+		windup = 1.3,
+		recovery = 0.95,
+		unparryable = false,
+		poise = 260,
+		poiseRegen = 5,
+		knockbackResist = 0.9,
+		bodyColor = Color3.fromRGB(34, 44, 34),
+		accentColor = Color3.fromRGB(214, 200, 158),
+		limbColor = Color3.fromRGB(24, 32, 24),
+		eyeColor = Color3.fromRGB(184, 255, 138),
+		glowColor = Color3.fromRGB(132, 224, 120),
+		bodyMaterial = Enum.Material.Slate,
+	} :: EnemyArchetype,
+}
+
+--[[
+	Boss waves.
+	A boss closes out every `EveryWaves` waves (2, 4, 6 ...). WaveManager reads the
+	schedule, EnemyAI reads nothing from here -- it just spawns whatever archetype
+	the plan names and tags the model `CB_Boss` so the client can raise the bar.
+]]
+CombatConfig.Boss = {
+	-- Wave 2, 4, 6, ... are bosses. Set to 0 to disable boss waves entirely.
+	EveryWaves = 2,
+	-- Rolled in order, one per boss wave, then wrapped.
+	Archetypes = { "OniShogun", "FossilTyrant" } :: { string },
+	-- Stacked on top of the ordinary wave scaling, so an early boss is still a boss.
+	HealthMultiplier = 3,
+	DamageMultiplier = 1.15,
+	-- Bosses never roll the per-spawn unparryable override: their whole kit is
+	-- readable, and a fully-unparryable boss is a coin flip rather than a duel.
+	-- The announcement text is owned by BossUI (see `BossState`); the payload
+	-- carries the name and the bar colours.
+	BarColor = Color3.fromRGB(255, 74, 74),
+	BarAccent = Color3.fromRGB(255, 196, 92),
+	Announcement = "BOSS APPROACHING",
+} :: {
+	EveryWaves: number,
+	Archetypes: { string },
+	HealthMultiplier: number,
+	DamageMultiplier: number,
+	BarColor: Color3,
+	BarAccent: Color3,
+	Announcement: string,
 }
 
 -- Enemy attack telegraph presentation, read by the client.
@@ -359,6 +444,8 @@ CombatConfig.Attributes = {
 
 	-- Written by WaveManager (players) and EnemyAI (enemies)
 	Wave = "CB_Wave",
+	-- Set by EnemyAI on a boss-wave enemy, so the client can pick it out of a pack.
+	Boss = "CB_Boss",
 
 	-- Written by the client for its own input gating and HUD (never replicated).
 	ChoiceOpen = "CB_ChoiceOpen",
@@ -642,6 +729,38 @@ CombatConfig.Fx = {
 	EnemyDeath = "rbxasset://sounds/uuhhh.mp3",
 	PerkSelect = "rbxasset://sounds/electronicpingshort.wav",
 	WaveClear = "rbxasset://sounds/electronicpingshort.wav",
+}
+
+--[[
+	Background music.
+	A looping bed under the fight, crossfaded by the client (MusicManager).
+
+	Every id is an uploaded audio asset: this workspace cannot author one, so the
+	slots ship empty and the manager simply stays silent until you paste ids in.
+	Any id you own works: `rbxassetid://<id>`. Leave a slot empty to fall back to
+	the next one (`Menu` -> `Intermission` -> silence).
+]]
+CombatConfig.Music = {
+	Enabled = true,
+	-- Master level the active track fades up to.
+	Volume = 0.35,
+	-- Crossfade times, in seconds.
+	FadeIn = 1.6,
+	FadeOut = 1.2,
+	-- Loops played while a wave is live.
+	Combat = "rbxassetid://137177134668386",
+	-- Loops played between waves and while a menu is up.
+	Intermission = "",
+	-- Optional distinct title-screen theme; empty falls back to Intermission.
+	Menu = "rbxassetid://1836102253",
+} :: {
+	Enabled: boolean,
+	Volume: number,
+	FadeIn: number,
+	FadeOut: number,
+	Combat: string,
+	Intermission: string,
+	Menu: string,
 }
 
 CombatConfig.Camera = {
